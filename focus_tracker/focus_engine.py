@@ -1,0 +1,222 @@
+"""
+Focus Score Engine
+Combines eye tracking metrics and computer activity metrics into a single
+concentration / focus score from 0 (completely unfocused) to 100 (deep focus).
+Also tracks focus history over time for trend analysis.
+"""
+
+import time
+from collections import deque
+from dataclasses import dataclass, field
+
+from focus_tracker.eye_tracker import EyeMetrics
+from focus_tracker.activity_monitor import ActivityMetrics
+
+
+@dataclass
+class FocusSnapshot:
+    """A single focus score reading with its components."""
+    timestamp: float = 0.0
+    # Overall score (0-100)
+    focus_score: float = 50.0
+    # Component scores (each 0-100)
+    eye_engagement_score: float = 50.0
+    gaze_stability_score: float = 50.0
+    blink_score: float = 50.0
+    activity_score: float = 50.0
+    app_focus_score: float = 50.0
+    # Derived state
+    state: str = "Neutral"  # "Deep Focus", "Focused", "Neutral", "Distracted", "Away"
+
+
+class FocusEngine:
+    """
+    Calculates a focus score by combining signals:
+
+    Eye Signals:
+    - Eye openness (EAR) — open eyes = engaged
+    - Gaze stability — looking at screen center = focused
+    - Blink rate — normal 15-20/min is fine, too high = fatigue, too low = staring
+    - Eye closure — prolonged = drowsy/distracted
+    - Head pose — facing screen = engaged
+
+    Computer Signals:
+    - Keyboard/mouse activity — some activity = working
+    - Idle time — long idle = possibly away or zoned out
+    - App switching — frequent switching = distracted
+    - Productive vs distracting apps
+    """
+
+    # Weights for final score
+    WEIGHTS = {
+        "eye_engagement": 0.20,
+        "gaze_stability": 0.20,
+        "blink": 0.10,
+        "activity": 0.25,
+        "app_focus": 0.25,
+    }
+
+    def __init__(self, history_minutes: int = 60):
+        max_entries = history_minutes * 60  # ~1 per second
+        self.history: deque[FocusSnapshot] = deque(maxlen=max_entries)
+        self._gaze_history: deque = deque(maxlen=30)  # for stability calc
+
+    def calculate(self, eye: EyeMetrics, activity: ActivityMetrics) -> FocusSnapshot:
+        """Compute focus score from the latest eye and activity metrics."""
+        snap = FocusSnapshot(timestamp=time.time())
+
+        # --- Eye Engagement (face + combined attention + sustained eye closure) ---
+        if not eye.face_detected:
+            snap.eye_engagement_score = 10.0  # face not visible = probably away
+        else:
+            # Base: face detected = engaged. Only penalize for sustained closure,
+            # NOT brief blinks (blinks are handled by blink_score separately).
+            if eye.eyes_closed_duration > 3.0:
+                eye_open_score = 20.0  # very drowsy
+            elif eye.eyes_closed_duration > 1.5:
+                eye_open_score = 40.0
+            elif eye.eyes_closed_duration > 0.5:
+                eye_open_score = 65.0
+            else:
+                eye_open_score = 100.0  # eyes open or just a normal blink
+
+            # Combined attention: fused head pose + eye gaze (more reliable than either alone)
+            if eye.looking_at_screen:
+                attention_score = 100.0
+            else:
+                # Magnitude of combined attention away from center
+                away_mag = (abs(eye.attention_h) ** 2 + abs(eye.attention_v) ** 2) ** 0.5
+                attention_score = _remap(away_mag, 0.3, 1.0, 85, 15)
+
+            snap.eye_engagement_score = min(100, (eye_open_score * 0.4 + attention_score * 0.6))
+
+        # --- Gaze Stability (uses combined head+eye attention for reliability) ---
+        self._gaze_history.append((eye.attention_h, eye.attention_v))
+        if len(self._gaze_history) >= 5:
+            h_vals = [g[0] for g in self._gaze_history]
+            v_vals = [g[1] for g in self._gaze_history]
+            h_var = _variance(h_vals)
+            v_var = _variance(v_vals)
+            total_var = h_var + v_var
+            # Low variance = stable gaze = focused
+            snap.gaze_stability_score = _remap(total_var, 0.0, 0.15, 100, 20)
+        else:
+            snap.gaze_stability_score = 50.0
+
+        # --- Blink Score ---
+        # Healthy range: 12-20 blinks/min. Score is continuous, not stepped.
+        bpm = eye.blinks_per_minute
+        if bpm <= 20:
+            # 0 bpm → 35, 12 bpm → 95, 20 bpm → 95 (peak in healthy range)
+            snap.blink_score = _remap(bpm, 0, 12, 35, 95)
+        else:
+            # 20 bpm → 95, 40+ bpm → 30 (excessive = fatigue/stress)
+            snap.blink_score = _remap(bpm, 20, 40, 95, 30)
+
+        # --- Activity Score ---
+        if activity.total_idle_seconds > 300:
+            snap.activity_score = 5.0  # away for 5+ minutes
+        elif activity.total_idle_seconds > 120:
+            snap.activity_score = 20.0
+        elif activity.total_idle_seconds > 60:
+            snap.activity_score = 40.0
+        elif activity.total_idle_seconds > 30:
+            snap.activity_score = 60.0
+        else:
+            # Active: base score from typing + mouse
+            type_score = _remap(activity.keys_per_minute, 0, 100, 30, 100)
+            mouse_score = _remap(activity.mouse_moves_per_minute, 0, 200, 30, 80)
+            snap.activity_score = max(type_score, mouse_score)
+
+        # Penalize excessive app switching (>8 switches/min = distracted)
+        switch_penalty = max(0, (activity.app_switches_per_minute - 4) * 8)
+        snap.activity_score = max(0, snap.activity_score - switch_penalty)
+
+        # --- App Focus Score ---
+        if activity.in_productive_app:
+            snap.app_focus_score = 90.0
+        else:
+            snap.app_focus_score = 25.0
+
+        # --- Weighted Final Score ---
+        snap.focus_score = (
+            snap.eye_engagement_score * self.WEIGHTS["eye_engagement"]
+            + snap.gaze_stability_score * self.WEIGHTS["gaze_stability"]
+            + snap.blink_score * self.WEIGHTS["blink"]
+            + snap.activity_score * self.WEIGHTS["activity"]
+            + snap.app_focus_score * self.WEIGHTS["app_focus"]
+        )
+        snap.focus_score = max(0, min(100, snap.focus_score))
+
+        # --- Determine State ---
+        if not eye.face_detected and activity.total_idle_seconds > 60:
+            snap.state = "Away"
+        elif snap.focus_score >= 80:
+            snap.state = "Deep Focus"
+        elif snap.focus_score >= 60:
+            snap.state = "Focused"
+        elif snap.focus_score >= 40:
+            snap.state = "Neutral"
+        else:
+            snap.state = "Distracted"
+
+        self.history.append(snap)
+        return snap
+
+    def get_average_score(self, last_n_seconds: int = 300) -> float:
+        """Average focus score over the last N seconds."""
+        if not self.history:
+            return 50.0
+        cutoff = time.time() - last_n_seconds
+        scores = [s.focus_score for s in self.history if s.timestamp >= cutoff]
+        return sum(scores) / len(scores) if scores else 50.0
+
+    def get_history_points(self, last_n_seconds: int = 300) -> list[tuple[float, float]]:
+        """Return (relative_time_seconds, score) pairs for graphing."""
+        if not self.history:
+            return []
+        now = time.time()
+        cutoff = now - last_n_seconds
+        return [
+            (s.timestamp - now, s.focus_score)
+            for s in self.history
+            if s.timestamp >= cutoff
+        ]
+
+    def get_session_summary(self) -> dict:
+        """Summary statistics for the entire session."""
+        if not self.history:
+            return {"avg_score": 0, "max_score": 0, "min_score": 0,
+                    "time_focused_pct": 0, "time_distracted_pct": 0}
+
+        scores = [s.focus_score for s in self.history]
+        states = [s.state for s in self.history]
+        total = len(states)
+
+        return {
+            "avg_score": sum(scores) / len(scores),
+            "max_score": max(scores),
+            "min_score": min(scores),
+            "time_focused_pct": (states.count("Deep Focus") + states.count("Focused")) / total * 100,
+            "time_distracted_pct": states.count("Distracted") / total * 100,
+            "time_away_pct": states.count("Away") / total * 100,
+            "total_readings": total,
+        }
+
+
+def _remap(value: float, in_min: float, in_max: float,
+           out_min: float, out_max: float) -> float:
+    """Linearly remap a value from one range to another, clamped."""
+    if in_max == in_min:
+        return (out_min + out_max) / 2
+    t = (value - in_min) / (in_max - in_min)
+    t = max(0.0, min(1.0, t))
+    return out_min + t * (out_max - out_min)
+
+
+def _variance(values: list[float]) -> float:
+    """Simple variance calculation."""
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    return sum((v - mean) ** 2 for v in values) / len(values)
