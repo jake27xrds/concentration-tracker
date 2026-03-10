@@ -141,7 +141,12 @@ class FocusEngine:
             snap.blink_score = _remap(bpm, 20, 40, 95, 30)
 
         # --- Activity Score ---
-        if activity.total_idle_seconds > 300:
+        # Reading overrides idle penalty: reading IS the activity, even without
+        # keyboard/mouse input. The eyes prove engagement.
+        if eye.is_reading and eye.reading_confidence > 0.3:
+            # Scale activity score with reading confidence (0.3-1.0 → 65-90)
+            snap.activity_score = 55 + eye.reading_confidence * 35
+        elif activity.total_idle_seconds > 300:
             snap.activity_score = 5.0  # away for 5+ minutes
         elif activity.total_idle_seconds > 120:
             snap.activity_score = 20.0

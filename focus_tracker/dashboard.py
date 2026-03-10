@@ -974,11 +974,12 @@ class FocusDashboard:
         if eye.face_detected:
             cal_str = "✓ Calibrated" if self.eye_tracker.calibrated else "Default"
             screen_str = "👁 Screen" if eye.looking_at_screen else "👀 Away"
+            reading_str = f"  📖 Reading ({eye.reading_confidence:.0%})" if eye.is_reading else ""
             eye_text = (
                 f"EAR: {eye.avg_ear:.3f}  ({cal_str})  |  Blinks/min: {eye.blinks_per_minute:.0f}\n"
                 f"Gaze: H={eye.gaze_horizontal:+.2f}  V={eye.gaze_vertical:+.2f}  |  "
                 f"Head: Yaw={eye.head_yaw:+.2f}  Pitch={eye.head_pitch:+.2f}\n"
-                f"Attention: {eye.attention_h:+.2f},{eye.attention_v:+.2f}  {screen_str}"
+                f"Attention: {eye.attention_h:+.2f},{eye.attention_v:+.2f}  {screen_str}{reading_str}"
             )
             if eye.eyes_closed_duration > 0.5:
                 eye_text += f"\n⚠ Eyes closed: {eye.eyes_closed_duration:.1f}s"
