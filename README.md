@@ -1,6 +1,8 @@
-# 🎯 Focus Tracker — Eye Tracking Concentration Monitor
+# 🎯 Focus Tracker — AI-Powered Concentration Monitor
 
-A real-time concentration monitoring app that uses your **webcam** and **computer activity** to calculate how focused you are.
+A real-time concentration monitoring app that uses your **webcam** (eye tracking + reading detection) and **computer activity** to calculate how focused you are.
+
+> **69 unit tests** · macOS native · MediaPipe face tracking · reading detection · break reminders
 
 ## What It Does
 
@@ -99,7 +101,8 @@ python -m focus_tracker
 | `focus_tracker/session_manager.py` | JSON session persistence and CSV export |
 | `focus_tracker/model_downloader.py` | Auto-downloads MediaPipe face model on first run |
 | `focus_tracker/main.py` | Entry point — wires everything together |
-| `tests/test_core.py` | Unit tests (18 tests covering engine, config, metrics) |
+| `tests/test_core.py` | Unit tests (66 tests covering engine, alerts, sessions, config, metrics) |
+| `tests/test_reading.py` | Reading detection tests (3 tests for saccade/fixation patterns) |
 
 ## Customization
 

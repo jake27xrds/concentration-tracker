@@ -167,6 +167,11 @@ class FocusDashboard:
                                                 text_color=COLORS["text_dim"])
         self.session_time_label.grid(row=2, column=0, sticky="w")
 
+        self.reading_label = ctk.CTkLabel(stats_frame, text="",
+                                           font=ctk.CTkFont(size=13, weight="bold"),
+                                           text_color=COLORS["accent_light"])
+        self.reading_label.grid(row=3, column=0, sticky="w")
+
         # Alert banner
         self.alert_frame = ctk.CTkFrame(top, fg_color=COLORS["alert_bg"],
                                          corner_radius=8, height=40)
@@ -713,26 +718,47 @@ class FocusDashboard:
     # ---- SCORE RING ----
 
     def _draw_score_ring(self, score: float, color: str):
-        """Draw a circular progress ring with the score in the center."""
+        """Draw a circular progress ring with glow and trend arrow."""
         c = self.score_canvas
         c.delete("all")
         cx, cy, r = 45, 45, 38
-        width = 6
+        width = 8
 
-        # Background arc (full circle, dim)
+        # Track ring background
         c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                       outline=COLORS["bg_dark"], width=width)
+                       outline=COLORS["bg_dark"], width=width + 2)
 
-        # Foreground arc (score portion)
-        extent = -3.6 * score  # negative = clockwise
+        # Glow layer (slightly larger, more transparent)
+        extent = -3.6 * score
         if abs(extent) > 1:
+            c.create_arc(cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2,
+                         start=90, extent=extent,
+                         outline=color, width=3, style="arc")
+            # Main arc
             c.create_arc(cx - r, cy - r, cx + r, cy + r,
                          start=90, extent=extent,
                          outline=color, width=width, style="arc")
 
-        # Score text in center
-        c.create_text(cx, cy, text=f"{score:.0f}",
-                       fill=color, font=("Helvetica", 28, "bold"))
+        # Trend arrow from recent history
+        trend = self._get_trend()
+        arrow = "↑" if trend > 2 else "↓" if trend < -2 else ""
+        arrow_color = COLORS["deep_focus"] if trend > 2 else COLORS["distracted"] if trend < -2 else color
+
+        # Score text
+        c.create_text(cx, cy - 3, text=f"{score:.0f}",
+                       fill=color, font=("Helvetica", 26, "bold"))
+        if arrow:
+            c.create_text(cx + 20, cy - 14, text=arrow,
+                           fill=arrow_color, font=("Helvetica", 12, "bold"))
+
+    def _get_trend(self) -> float:
+        """Return score trend: positive = improving, negative = declining."""
+        history = self.focus_engine.history
+        if len(history) < 30:
+            return 0.0
+        recent = [s.focus_score for s in list(history)[-15:]]
+        older = [s.focus_score for s in list(history)[-30:-15]]
+        return (sum(recent) / len(recent)) - (sum(older) / len(older))
 
     # ---- GRAPH DRAWING ----
 
@@ -806,15 +832,24 @@ class FocusDashboard:
                 y = margin_t + plot_h * (1 - score / 100)
                 coords.append((x, y))
 
-            # Fill under curve
+            # Gradient fill under curve (layered strips for depth)
             if len(coords) >= 2:
-                fill_coords = [(coords[0][0], margin_t + plot_h)]
+                bottom = margin_t + plot_h
+                fill_coords = [(coords[0][0], bottom)]
                 fill_coords.extend(coords)
-                fill_coords.append((coords[-1][0], margin_t + plot_h))
+                fill_coords.append((coords[-1][0], bottom))
                 flat = [c for pt in fill_coords for c in pt]
                 canvas.create_polygon(flat, fill=COLORS["accent"], stipple="gray25", outline="")
+                # Second lighter layer (upper half only)
+                mid_y = margin_t + plot_h * 0.5
+                upper_coords = [(x, max(y, mid_y)) for x, y in coords]
+                upper_fill = [(upper_coords[0][0], bottom)]
+                upper_fill.extend(upper_coords)
+                upper_fill.append((upper_coords[-1][0], bottom))
+                flat_upper = [c for pt in upper_fill for c in pt]
+                canvas.create_polygon(flat_upper, fill=COLORS["accent"], stipple="gray50", outline="")
 
-            # Line
+            # Line with color-coded segments
             for i in range(len(coords) - 1):
                 x1, y1 = coords[i]
                 x2, y2 = coords[i + 1]
@@ -823,14 +858,22 @@ class FocusDashboard:
                          COLORS["focused"] if score >= 60 else
                          COLORS["neutral"] if score >= 40 else
                          COLORS["distracted"])
-                canvas.create_line(x1, y1, x2, y2, fill=color, width=2, smooth=True)
+                canvas.create_line(x1, y1, x2, y2, fill=color, width=2.5, smooth=True)
 
-            # Current score dot
+            # Current score dot with glow
             if coords:
                 lx, ly = coords[-1]
+                cur_color = state_color(self._latest_snapshot.state)
+                canvas.create_oval(lx - 8, ly - 8, lx + 8, ly + 8,
+                                    fill="", outline=cur_color, width=1)
                 canvas.create_oval(lx - 5, ly - 5, lx + 5, ly + 5,
-                                    fill=state_color(self._latest_snapshot.state),
-                                    outline="white", width=2)
+                                    fill=cur_color, outline="white", width=2)
+
+                # Score label next to dot
+                cur_score = self._latest_snapshot.focus_score
+                label_y = ly - 14 if ly > margin_t + 20 else ly + 14
+                canvas.create_text(lx, label_y, text=f"{cur_score:.0f}",
+                                    fill="white", font=("Menlo", 10, "bold"))
 
     # ---- MAIN LOOP ----
 
@@ -938,6 +981,15 @@ class FocusDashboard:
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
         self.session_time_label.configure(text=f"Session: {mins}:{secs:02d}")
+
+        # Reading mode indicator in top bar
+        if eye.is_reading and eye.reading_confidence > 0.3:
+            if eye.reading_confidence > 0.7:
+                self.reading_label.configure(text=f"📖 Deep Reading ({eye.reading_confidence:.0%})")
+            else:
+                self.reading_label.configure(text=f"📖 Reading ({eye.reading_confidence:.0%})")
+        else:
+            self.reading_label.configure(text="")
 
         # Settings slider readouts
         self.distraction_val.configure(text=f"{int(self.distraction_slider.get())}s")

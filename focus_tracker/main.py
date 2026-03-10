@@ -3,9 +3,9 @@ Focus Tracker — Main Entry Point
 Launches the eye tracker, activity monitor, focus engine, and dashboard.
 """
 
-import sys
 import signal
 import logging
+import argparse
 
 from focus_tracker.eye_tracker import EyeTracker
 from focus_tracker.activity_monitor import ActivityMonitor
@@ -15,13 +15,40 @@ from focus_tracker.dashboard import FocusDashboard
 log = logging.getLogger("focus_tracker.main")
 
 
-def main():
-    log.info("Focus Tracker — Starting up")
+def parse_args() -> argparse.Namespace:
+    """Parse command-line options for runtime configuration."""
+    parser = argparse.ArgumentParser(description="Run the Focus Tracker dashboard.")
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="Webcam index to open (default: 0).",
+    )
+    parser.add_argument(
+        "--history-minutes",
+        type=int,
+        default=60,
+        help="Focus history window size in minutes (default: 60).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    history_minutes = max(1, args.history_minutes)
+    if history_minutes != args.history_minutes:
+        log.warning("history_minutes must be >= 1; using %d", history_minutes)
+
+    log.info(
+        "Focus Tracker — Starting up (camera_index=%d, history_minutes=%d)",
+        args.camera_index,
+        history_minutes,
+    )
 
     # --- Initialize components ---
-    eye_tracker = EyeTracker(camera_index=0)
+    eye_tracker = EyeTracker(camera_index=args.camera_index)
     activity_monitor = ActivityMonitor()
-    focus_engine = FocusEngine(history_minutes=60)
+    focus_engine = FocusEngine(history_minutes=history_minutes)
 
     # --- Start eye tracker ---
     camera_available = False
@@ -33,14 +60,16 @@ def main():
     except RuntimeError as e:
         log.warning("Camera unavailable: %s", e)
         log.info("Running in activity-only mode (keyboard/mouse/app tracking)")
+    except Exception:
+        log.exception("Unexpected eye tracker startup error; continuing without camera")
 
     # --- Start activity monitor ---
     log.info("Starting activity monitor...")
     try:
         activity_monitor.start()
         log.info("Mouse & keyboard tracking active")
-    except Exception as e:
-        log.warning("Activity monitor error: %s — continuing without it", e)
+    except Exception:
+        log.exception("Activity monitor error; continuing without it")
 
     log.info("Launching dashboard...")
 
@@ -50,10 +79,22 @@ def main():
         camera_available=camera_available,
     )
 
-    def shutdown(*_):
+    shutting_down = False
+
+    def shutdown(*_) -> None:
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
         log.info("Shutting down...")
-        eye_tracker.stop()
-        activity_monitor.stop()
+        try:
+            eye_tracker.stop()
+        except Exception:
+            log.exception("Error while stopping eye tracker")
+        try:
+            activity_monitor.stop()
+        except Exception:
+            log.exception("Error while stopping activity monitor")
         summary = focus_engine.get_session_summary()
         if summary["total_readings"] > 0:
             log.info(
@@ -65,7 +106,17 @@ def main():
                 summary.get("time_away_pct", 0),
             )
 
-    signal.signal(signal.SIGINT, lambda *_: (shutdown(), sys.exit(0)))
+    def _signal_handler(signum, _frame):
+        log.info("Received signal %s", signum)
+        shutdown()
+        if getattr(dashboard, "root", None) is not None:
+            try:
+                dashboard.root.after(0, dashboard.root.destroy)
+            except Exception:
+                log.exception("Failed to close dashboard after signal")
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     try:
         dashboard.start()  # blocks until window is closed

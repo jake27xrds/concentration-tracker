@@ -1,13 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "focus-tracker"
 version = "1.0.0"
-description = "Eye tracking and computer activity monitor to measure concentration"
+description = "AI-powered eye tracking and computer activity monitor for measuring concentration"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["eye-tracking", "focus", "concentration", "mediapipe", "productivity"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Human Machine Interfaces",
+]
 dependencies = [
     "opencv-python>=4.8.0",
     "mediapipe>=0.10.0",
     "numpy>=1.24.0",
     "pyobjc-framework-Quartz>=9.0",
+    "pyobjc-framework-ApplicationServices>=9.0",
     "pynput>=1.7.6",
     "customtkinter>=5.2.0",
     "Pillow>=10.0.0",
@@ -18,6 +35,9 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 focus-tracker = "focus_tracker.main:main"
+
+[tool.setuptools.packages.find]
+include = ["focus_tracker*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
