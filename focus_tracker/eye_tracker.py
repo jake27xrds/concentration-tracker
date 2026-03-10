@@ -50,6 +50,9 @@ class EyeMetrics:
     looking_at_screen: bool = False
     # Confidence that head is facing camera (0-1, higher = more frontal)
     head_frontal_confidence: float = 0.0
+    # Reading detection
+    is_reading: bool = False
+    reading_confidence: float = 0.0
 
 
 # MediaPipe Face Mesh landmark indices for eyes
@@ -86,6 +89,118 @@ FACE_OVAL = [
 
 # Nose bridge for face tracking visualization
 NOSE_BRIDGE = [168, 6, 197, 195, 5, 4, 1]
+
+
+class ReadingDetector:
+    """
+    Detects reading behaviour from gaze patterns.
+
+    Reading produces distinctive eye movements:
+    - Small horizontal saccades (jumps) progressing left-to-right
+    - Brief fixation pauses between saccades (~200-400ms)
+    - Low vertical drift within a line
+    - Periodic line-return sweeps (large right-to-left jump)
+
+    We analyse a rolling window of raw gaze samples and score how
+    closely the pattern matches reading.
+    """
+
+    def __init__(self):
+        # Rolling window of (timestamp, gaze_h, gaze_v)
+        self._gaze_samples: deque = deque(maxlen=90)  # ~3 seconds at 30fps
+        self._reading_confidence = 0.0
+        # Smoothed output (reading state shouldn't flicker)
+        self._confidence_buffer: deque = deque(maxlen=15)
+        # Saccade detection
+        self._last_h = 0.0
+        self._saccade_directions: deque = deque(maxlen=40)  # +1=right, -1=left
+        self._fixation_count = 0
+        self._fixation_start: float | None = None
+        self._fixation_durations: deque = deque(maxlen=30)
+        self._FIXATION_THRESHOLD = 0.015  # gaze movement below this = fixation
+        self._SACCADE_THRESHOLD = 0.03    # gaze jump above this = saccade
+
+    def update(self, timestamp: float, gaze_h: float, gaze_v: float,
+               looking_at_screen: bool) -> tuple[bool, float]:
+        """Feed a new gaze sample. Returns (is_reading, confidence 0-1)."""
+        self._gaze_samples.append((timestamp, gaze_h, gaze_v))
+
+        if not looking_at_screen or len(self._gaze_samples) < 15:
+            self._confidence_buffer.append(0.0)
+            return self._smoothed_result()
+
+        # Detect saccades vs fixations from frame-to-frame horizontal delta
+        dh = gaze_h - self._last_h
+        self._last_h = gaze_h
+        abs_dh = abs(dh)
+
+        if abs_dh > self._SACCADE_THRESHOLD:
+            # Saccade detected
+            direction = 1.0 if dh > 0 else -1.0
+            self._saccade_directions.append(direction)
+            self._fixation_start = None
+        elif abs_dh < self._FIXATION_THRESHOLD:
+            # Fixation (eyes relatively still)
+            if self._fixation_start is None:
+                self._fixation_start = timestamp
+            dur = timestamp - self._fixation_start
+            if dur > 0.15:  # fixation must last at least 150ms
+                if len(self._fixation_durations) == 0 or self._fixation_durations[-1] != dur:
+                    self._fixation_durations.append(dur)
+
+        # Score the pattern
+        score = self._score_pattern()
+        self._confidence_buffer.append(score)
+        return self._smoothed_result()
+
+    def _score_pattern(self) -> float:
+        """Score how reading-like the recent gaze pattern is (0-1)."""
+        score = 0.0
+
+        # 1. Saccade directionality: reading = mostly forward (right) saccades
+        #    with occasional line-return (left) sweeps
+        if len(self._saccade_directions) >= 5:
+            rights = sum(1 for d in self._saccade_directions if d > 0)
+            total = len(self._saccade_directions)
+            forward_ratio = rights / total
+            # Reading typically has 70-85% forward saccades
+            if 0.55 <= forward_ratio <= 0.92:
+                score += 0.35
+            elif 0.45 <= forward_ratio <= 0.95:
+                score += 0.15
+
+        # 2. Fixation count: reading produces regular fixations
+        recent_fixations = len(self._fixation_durations)
+        if recent_fixations >= 3:
+            score += min(0.25, recent_fixations * 0.04)
+
+        # 3. Fixation duration regularity: reading fixations are ~200-400ms
+        if len(self._fixation_durations) >= 3:
+            durations = list(self._fixation_durations)
+            avg_dur = sum(durations) / len(durations)
+            if 0.15 <= avg_dur <= 0.6:
+                score += 0.20
+            elif 0.10 <= avg_dur <= 1.0:
+                score += 0.08
+
+        # 4. Low vertical drift: reading stays on ~same vertical line
+        if len(self._gaze_samples) >= 15:
+            recent = list(self._gaze_samples)[-15:]
+            v_vals = [s[2] for s in recent]
+            v_range = max(v_vals) - min(v_vals)
+            if v_range < 0.08:
+                score += 0.20
+            elif v_range < 0.15:
+                score += 0.10
+
+        return min(1.0, score)
+
+    def _smoothed_result(self) -> tuple[bool, float]:
+        if not self._confidence_buffer:
+            return False, 0.0
+        avg = sum(self._confidence_buffer) / len(self._confidence_buffer)
+        is_reading = avg >= 0.35
+        return is_reading, round(avg, 3)
 
 
 class EyeTracker:
@@ -143,6 +258,9 @@ class EyeTracker:
         # Face loss recovery: keep last-known metrics briefly when face disappears
         self._face_lost_at: float | None = None
         self._FACE_GRACE_PERIOD = 2.0  # seconds to keep last metrics after face loss
+
+        # Reading detector
+        self._reading_detector = ReadingDetector()
 
         self._running = False
 
@@ -323,6 +441,14 @@ class EyeTracker:
 
             # --- Combined Attention (head pose + eye gaze fusion) ---
             self._compute_combined_attention(metrics)
+
+            # --- Reading Detection ---
+            is_reading, reading_conf = self._reading_detector.update(
+                metrics.timestamp, metrics.gaze_horizontal, metrics.gaze_vertical,
+                metrics.looking_at_screen
+            )
+            metrics.is_reading = is_reading
+            metrics.reading_confidence = reading_conf
 
             # --- Annotate frame ---
             self._annotate(frame, pts, metrics)
@@ -575,6 +701,14 @@ class EyeTracker:
         cv2.rectangle(frame, (badge_x, 8), (badge_x + 100, 32), badge_color, -1)
         cv2.putText(frame, badge_text, (badge_x + 8, 27),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # --- Reading badge ---
+        if metrics.is_reading:
+            rd_x = w - 110
+            cv2.rectangle(frame, (rd_x, 36), (rd_x + 100, 58), (180, 120, 0), -1)
+            conf_pct = int(metrics.reading_confidence * 100)
+            cv2.putText(frame, f"READING {conf_pct}%", (rd_x + 4, 53),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
         # --- Status text ---
         color = (0, 255, 0) if metrics.face_detected else (0, 0, 255)

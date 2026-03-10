@@ -100,6 +100,10 @@ class FocusEngine:
 
             snap.eye_engagement_score = min(100, (eye_open_score * 0.4 + attention_score * 0.6))
 
+            # Reading = actively processing screen content → strong engagement signal
+            if eye.is_reading and eye.reading_confidence > 0.3:
+                snap.eye_engagement_score = min(100, snap.eye_engagement_score + 15)
+
         # --- Gaze Stability (uses combined head+eye attention for reliability) ---
         # Two-tier: only penalize variance that persists (sustained drift),
         # not brief saccades which are normal during reading.
@@ -120,6 +124,11 @@ class FocusEngine:
             snap.gaze_stability_score = _remap(sustained_var, 0.0, 0.15, 100, 20)
         else:
             snap.gaze_stability_score = 50.0
+
+        # Reading boost: saccades during reading are intentional, not instability
+        if eye.is_reading:
+            reading_boost = eye.reading_confidence * 25  # up to +25 pts
+            snap.gaze_stability_score = min(100, snap.gaze_stability_score + reading_boost)
 
         # --- Blink Score ---
         # Healthy range: 12-20 blinks/min. Score is continuous, not stepped.
