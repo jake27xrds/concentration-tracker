@@ -3,6 +3,21 @@ name = "focus-tracker"
 version = "1.0.0"
 description = "Eye tracking and computer activity monitor to measure concentration"
 requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8.0",
+    "mediapipe>=0.10.0",
+    "numpy>=1.24.0",
+    "pyobjc-framework-Quartz>=9.0",
+    "pynput>=1.7.6",
+    "customtkinter>=5.2.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
 
 [project.scripts]
 focus-tracker = "focus_tracker.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

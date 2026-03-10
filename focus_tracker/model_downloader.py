@@ -3,9 +3,12 @@ Model Downloader
 Downloads the MediaPipe FaceLandmarker model on first run.
 """
 
+import logging
 import os
 import ssl
 import urllib.request
+
+log = logging.getLogger("focus_tracker.model")
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 MODEL_FILENAME = "face_landmarker.task"
@@ -24,41 +27,47 @@ def ensure_model() -> str:
         return MODEL_PATH
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    print(f"   Downloading FaceLandmarker model...")
-    print(f"   From: {MODEL_URL}")
+    log.info("Downloading FaceLandmarker model from %s", MODEL_URL)
 
     # Create SSL context — try default first, fall back to certifi or unverified
     try:
         import certifi
         ctx = ssl.create_default_context(cafile=certifi.where())
     except ImportError:
-        # On macOS, Python's bundled SSL may lack certs — use system certs
         ctx = ssl.create_default_context()
-        # If that also fails, we'll catch below
 
     try:
         _download(MODEL_URL, MODEL_PATH, ctx)
     except (ssl.SSLCertVerificationError, urllib.error.URLError):
-        # Fall back: try without SSL verification
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        print("   ⚠ SSL verification failed, downloading without verification...")
+        log.warning("SSL verification failed, retrying without verification")
         _download(MODEL_URL, MODEL_PATH, ctx)
 
     size_mb = os.path.getsize(MODEL_PATH) / (1024 * 1024)
-    print(f"   ✓ Model downloaded ({size_mb:.1f} MB)")
+    log.info("Model downloaded (%.1f MB)", size_mb)
 
     return MODEL_PATH
 
 
 def _download(url: str, dest: str, ctx: ssl.SSLContext):
-    """Download a URL to a file using the given SSL context."""
+    """Download a URL to a file with progress logging."""
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, context=ctx) as resp:
+        total = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
+        last_pct = -1
         with open(dest, "wb") as f:
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
                     break
                 f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = int(downloaded / total * 100)
+                    # Log every 10%
+                    if pct // 10 > last_pct // 10:
+                        log.info("   Download progress: %d%%", pct)
+                        last_pct = pct

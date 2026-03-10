@@ -1,0 +1,27 @@
+{
+  "session_id": "2026-03-10_09-29-58",
+  "start_time": 1773160198.7584598,
+  "end_time": 1773160199.5425658,
+  "duration_minutes": 0.01306843360265096,
+  "summary": {
+    "avg_score": 63.5,
+    "max_score": 63.5,
+    "min_score": 63.5,
+    "time_focused_pct": 100.0,
+    "time_distracted_pct": 0.0,
+    "time_away_pct": 0.0,
+    "total_readings": 1
+  },
+  "snapshots": [
+    {
+      "timestamp": 1773160199.542538,
+      "focus_score": 63.5,
+      "state": "Focused",
+      "eye_engagement": 100,
+      "gaze_stability": 50.0,
+      "blink": 35.0,
+      "activity": 30.0,
+      "app_focus": 90.0
+    }
+  ]
+}

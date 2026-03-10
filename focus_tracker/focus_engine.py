@@ -6,11 +6,14 @@ Also tracks focus history over time for trend analysis.
 """
 
 import time
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 
 from focus_tracker.eye_tracker import EyeMetrics
 from focus_tracker.activity_monitor import ActivityMetrics
+
+log = logging.getLogger("focus_tracker.engine")
 
 
 @dataclass
@@ -60,6 +63,13 @@ class FocusEngine:
         max_entries = history_minutes * 60  # ~1 per second
         self.history: deque[FocusSnapshot] = deque(maxlen=max_entries)
         self._gaze_history: deque = deque(maxlen=30)  # for stability calc
+        self._gaze_variance_history: deque = deque(maxlen=20)  # sustained variance tracking
+
+        # Hysteresis: prevent state jitter on score boundaries
+        self._current_state = "Neutral"
+        self._state_entered_at = time.time()
+        self._HYSTERESIS_MARGIN = 3.0    # score must cross threshold by this margin
+        self._MIN_STATE_HOLD = 2.0       # minimum seconds before transitioning down
 
     def calculate(self, eye: EyeMetrics, activity: ActivityMetrics) -> FocusSnapshot:
         """Compute focus score from the latest eye and activity metrics."""
@@ -91,15 +101,23 @@ class FocusEngine:
             snap.eye_engagement_score = min(100, (eye_open_score * 0.4 + attention_score * 0.6))
 
         # --- Gaze Stability (uses combined head+eye attention for reliability) ---
+        # Two-tier: only penalize variance that persists (sustained drift),
+        # not brief saccades which are normal during reading.
         self._gaze_history.append((eye.attention_h, eye.attention_v))
         if len(self._gaze_history) >= 5:
             h_vals = [g[0] for g in self._gaze_history]
             v_vals = [g[1] for g in self._gaze_history]
-            h_var = _variance(h_vals)
-            v_var = _variance(v_vals)
-            total_var = h_var + v_var
-            # Low variance = stable gaze = focused
-            snap.gaze_stability_score = _remap(total_var, 0.0, 0.15, 100, 20)
+            instant_var = _variance(h_vals) + _variance(v_vals)
+            self._gaze_variance_history.append(instant_var)
+
+            # Use median of recent variance windows — filters brief spikes
+            if len(self._gaze_variance_history) >= 3:
+                sorted_vars = sorted(self._gaze_variance_history)
+                sustained_var = sorted_vars[len(sorted_vars) // 2]  # median
+            else:
+                sustained_var = instant_var
+
+            snap.gaze_stability_score = _remap(sustained_var, 0.0, 0.15, 100, 20)
         else:
             snap.gaze_stability_score = 50.0
 
@@ -132,9 +150,16 @@ class FocusEngine:
         switch_penalty = max(0, (activity.app_switches_per_minute - 4) * 8)
         snap.activity_score = max(0, snap.activity_score - switch_penalty)
 
-        # --- App Focus Score ---
-        if activity.in_productive_app:
+        # --- App Focus Score (3-tier: productive / neutral / distracting) ---
+        if hasattr(activity, 'app_classification'):
+            classification = activity.app_classification
+        else:
+            classification = "productive" if activity.in_productive_app else "distracting"
+
+        if classification == "productive":
             snap.app_focus_score = 90.0
+        elif classification == "neutral":
+            snap.app_focus_score = 55.0
         else:
             snap.app_focus_score = 25.0
 
@@ -148,20 +173,63 @@ class FocusEngine:
         )
         snap.focus_score = max(0, min(100, snap.focus_score))
 
-        # --- Determine State ---
+        # --- Determine State (with hysteresis to prevent jitter) ---
         if not eye.face_detected and activity.total_idle_seconds > 60:
-            snap.state = "Away"
+            raw_state = "Away"
         elif snap.focus_score >= 80:
-            snap.state = "Deep Focus"
+            raw_state = "Deep Focus"
         elif snap.focus_score >= 60:
-            snap.state = "Focused"
+            raw_state = "Focused"
         elif snap.focus_score >= 40:
-            snap.state = "Neutral"
+            raw_state = "Neutral"
         else:
-            snap.state = "Distracted"
+            raw_state = "Distracted"
+
+        snap.state = self._apply_hysteresis(raw_state, snap.focus_score)
 
         self.history.append(snap)
         return snap
+
+    # State ranking for hysteresis: higher = better focus
+    _STATE_RANK = {"Distracted": 0, "Neutral": 1, "Focused": 2, "Deep Focus": 3, "Away": -1}
+
+    def _apply_hysteresis(self, raw_state: str, score: float) -> str:
+        """
+        Prevent state jitter by requiring:
+        1. Score crosses threshold by a margin before upgrading/downgrading.
+        2. Minimum hold time before transitioning to a worse state.
+        """
+        now = time.time()
+
+        # "Away" always takes effect immediately
+        if raw_state == "Away" or self._current_state == "Away":
+            if raw_state != self._current_state:
+                self._current_state = raw_state
+                self._state_entered_at = now
+            return raw_state
+
+        raw_rank = self._STATE_RANK.get(raw_state, 1)
+        cur_rank = self._STATE_RANK.get(self._current_state, 1)
+
+        # Upgrading (improving focus) — apply immediately with small margin
+        if raw_rank > cur_rank:
+            # Check that we're clearly past the threshold (margin)
+            thresholds = {"Deep Focus": 80, "Focused": 60, "Neutral": 40}
+            threshold = thresholds.get(raw_state, 0)
+            if score >= threshold + self._HYSTERESIS_MARGIN:
+                self._current_state = raw_state
+                self._state_entered_at = now
+
+        # Downgrading (losing focus) — require margin + hold time
+        elif raw_rank < cur_rank:
+            thresholds = {"Focused": 80, "Neutral": 60, "Distracted": 40}
+            threshold = thresholds.get(self._current_state, 100)
+            time_in_state = now - self._state_entered_at
+            if score < threshold - self._HYSTERESIS_MARGIN and time_in_state >= self._MIN_STATE_HOLD:
+                self._current_state = raw_state
+                self._state_entered_at = now
+
+        return self._current_state
 
     def get_average_score(self, last_n_seconds: int = 300) -> float:
         """Average focus score over the last N seconds."""

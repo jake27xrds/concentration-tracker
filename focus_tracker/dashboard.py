@@ -9,6 +9,7 @@ A CustomTkinter-based live dashboard with tabs for:
 import time
 import threading
 import subprocess
+import logging
 import tkinter as tk
 from collections import deque
 from datetime import datetime
@@ -23,6 +24,9 @@ from focus_tracker.activity_monitor import ActivityMonitor, ActivityMetrics
 from focus_tracker.focus_engine import FocusEngine, FocusSnapshot
 from focus_tracker.alerts import AlertManager, AlertState
 from focus_tracker.session_manager import SessionManager
+from focus_tracker.config import load_config, save_config
+
+log = logging.getLogger("focus_tracker.dashboard")
 
 
 # Color scheme
@@ -62,12 +66,16 @@ class FocusDashboard:
     UPDATE_INTERVAL_MS = 100  # ~10 FPS
 
     def __init__(self, eye_tracker: EyeTracker, activity_monitor: ActivityMonitor,
-                 focus_engine: FocusEngine):
+                 focus_engine: FocusEngine, camera_available: bool = True):
         self.eye_tracker = eye_tracker
         self.activity_monitor = activity_monitor
         self.focus_engine = focus_engine
         self.alert_manager = AlertManager()
         self.session_manager = SessionManager()
+        self.camera_available = camera_available
+
+        # Load persisted settings
+        self._config = load_config()
 
         self._latest_snapshot = FocusSnapshot()
         self._alert_state = AlertState()
@@ -77,6 +85,7 @@ class FocusDashboard:
         # Graph data buffer
         self._graph_scores: deque = deque(maxlen=600)  # 10 min at 1/sec
         self._graph_states: deque = deque(maxlen=600)
+        self._last_graph_draw = 0.0  # throttle graph redraws to 1/sec
 
         # --- Build Window ---
         ctk.set_appearance_mode("dark")
@@ -89,6 +98,7 @@ class FocusDashboard:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_layout()
+        self._apply_config()
 
     def _build_layout(self):
         """Create the tabbed UI."""
@@ -126,12 +136,12 @@ class FocusDashboard:
         score_frame = ctk.CTkFrame(top, fg_color="transparent")
         score_frame.grid(row=0, column=0, padx=15, pady=8)
 
-        self.top_score_label = ctk.CTkLabel(
-            score_frame, text="50",
-            font=ctk.CTkFont(size=48, weight="bold"),
-            text_color=COLORS["neutral"]
+        # Score ring canvas
+        self.score_canvas = tk.Canvas(
+            score_frame, width=90, height=90,
+            bg=COLORS["bg_card"], highlightthickness=0
         )
-        self.top_score_label.grid(row=0, column=0)
+        self.score_canvas.grid(row=0, column=0)
 
         self.top_state_label = ctk.CTkLabel(
             score_frame, text="Neutral",
@@ -539,6 +549,21 @@ class FocusDashboard:
 
     # ---- ACTIONS ----
 
+    def _apply_config(self):
+        """Apply loaded config to UI widgets and managers."""
+        cfg = self._config
+        self.sound_var.set(cfg.get("sound_enabled", True))
+        self.alert_manager.sound_enabled = self.sound_var.get()
+        self.distraction_slider.set(cfg.get("distraction_threshold_seconds", 30))
+        self.break_slider.set(cfg.get("break_interval_minutes", 25))
+
+    def _save_current_config(self):
+        """Persist current UI settings to disk."""
+        self._config["sound_enabled"] = self.sound_var.get()
+        self._config["distraction_threshold_seconds"] = int(self.distraction_slider.get())
+        self._config["break_interval_minutes"] = int(self.break_slider.get())
+        save_config(self._config)
+
     def _dismiss_alert(self):
         self.alert_frame.grid_remove()
 
@@ -551,8 +576,17 @@ class FocusDashboard:
 
     def _check_permissions(self):
         """Check macOS permission status and update indicators."""
-        # Camera — if the tracker has frames, camera is working
-        if self.eye_tracker.annotated_frame is not None:
+        act = self.activity_monitor.latest_metrics
+        running_time = time.time() - self.session_manager.session_start
+
+        # Camera
+        if not self.camera_available:
+            self.cam_status.configure(text="● Camera", text_color=COLORS["distracted"])
+            self.cam_status_detail.configure(
+                text="Unavailable — check connection or permission",
+                text_color=COLORS["distracted"],
+            )
+        elif self.eye_tracker.annotated_frame is not None:
             self.cam_status.configure(text="● Camera", text_color=COLORS["deep_focus"])
             self.cam_status_detail.configure(text="Granted ✓", text_color=COLORS["deep_focus"])
         else:
@@ -560,23 +594,37 @@ class FocusDashboard:
             self.cam_status_detail.configure(text="No frames yet — may need permission",
                                              text_color=COLORS["neutral"])
 
-        # Accessibility — check if keyboard/mouse events are being received
-        act = self.activity_monitor.latest_metrics
-        # If we've been running > 5s and still zero activity, likely no permission
-        running_time = time.time() - self.session_manager.session_start
-        if running_time > 5 and act.keys_per_minute == 0 and act.mouse_moves_per_minute == 0:
+        # Accessibility — use AXIsProcessTrusted() for reliable detection
+        try:
+            from ApplicationServices import AXIsProcessTrusted
+            ax_trusted = AXIsProcessTrusted()
+        except ImportError:
+            ax_trusted = None
+
+        if ax_trusted is True:
+            self.acc_status.configure(text="● Accessibility", text_color=COLORS["deep_focus"])
+            self.acc_status_detail.configure(text="Granted ✓", text_color=COLORS["deep_focus"])
+        elif ax_trusted is False:
             self.acc_status.configure(text="● Accessibility", text_color=COLORS["distracted"])
             self.acc_status_detail.configure(
                 text="Not granted — keyboard/mouse tracking disabled",
-                text_color=COLORS["distracted"]
+                text_color=COLORS["distracted"],
             )
-        elif running_time > 5:
-            self.acc_status.configure(text="● Accessibility", text_color=COLORS["deep_focus"])
-            self.acc_status_detail.configure(text="Granted ✓", text_color=COLORS["deep_focus"])
         else:
-            self.acc_status.configure(text="● Accessibility", text_color=COLORS["neutral"])
-            self.acc_status_detail.configure(text="Waiting for data...",
-                                             text_color=COLORS["text_dim"])
+            # Fallback: heuristic check
+            if running_time > 5 and act.keys_per_minute == 0 and act.mouse_moves_per_minute == 0:
+                self.acc_status.configure(text="● Accessibility", text_color=COLORS["distracted"])
+                self.acc_status_detail.configure(
+                    text="Not granted — keyboard/mouse tracking disabled",
+                    text_color=COLORS["distracted"],
+                )
+            elif running_time > 5:
+                self.acc_status.configure(text="● Accessibility", text_color=COLORS["deep_focus"])
+                self.acc_status_detail.configure(text="Granted ✓", text_color=COLORS["deep_focus"])
+            else:
+                self.acc_status.configure(text="● Accessibility", text_color=COLORS["neutral"])
+                self.acc_status_detail.configure(text="Waiting for data...",
+                                                 text_color=COLORS["text_dim"])
 
         # Screen Recording — check if we can read window titles
         if running_time > 5 and act.active_window_title and act.active_window_title != "Unknown":
@@ -661,6 +709,30 @@ class FocusDashboard:
             ctk.CTkLabel(row, text=f"{date_str}  •  {dur:.0f} min",
                          font=ctk.CTkFont(size=12),
                          text_color=COLORS["text"]).grid(row=0, column=1, padx=4, pady=6, sticky="w")
+
+    # ---- SCORE RING ----
+
+    def _draw_score_ring(self, score: float, color: str):
+        """Draw a circular progress ring with the score in the center."""
+        c = self.score_canvas
+        c.delete("all")
+        cx, cy, r = 45, 45, 38
+        width = 6
+
+        # Background arc (full circle, dim)
+        c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                       outline=COLORS["bg_dark"], width=width)
+
+        # Foreground arc (score portion)
+        extent = -3.6 * score  # negative = clockwise
+        if abs(extent) > 1:
+            c.create_arc(cx - r, cy - r, cx + r, cy + r,
+                         start=90, extent=extent,
+                         outline=color, width=width, style="arc")
+
+        # Score text in center
+        c.create_text(cx, cy, text=f"{score:.0f}",
+                       fill=color, font=("Helvetica", 28, "bold"))
 
     # ---- GRAPH DRAWING ----
 
@@ -771,8 +843,10 @@ class FocusDashboard:
         self.root.mainloop()
 
     def _on_close(self):
-        """Save session and close."""
+        """Save session and settings, then close."""
         self._running = False
+        # Save settings
+        self._save_current_config()
         # Final save
         snapshots = list(self.focus_engine.history)
         if snapshots:
@@ -781,12 +855,18 @@ class FocusDashboard:
         self.root.destroy()
 
     def _process_loop(self):
+        consecutive_errors = 0
         while self._running:
             try:
                 if self._calibrating:
                     time.sleep(0.1)
                     continue
-                eye_metrics = self.eye_tracker.process_frame()
+
+                if self.camera_available:
+                    eye_metrics = self.eye_tracker.process_frame()
+                else:
+                    eye_metrics = EyeMetrics()
+
                 activity_metrics = self.activity_monitor.get_metrics()
                 snapshot = self.focus_engine.calculate(eye_metrics, activity_metrics)
                 self._latest_snapshot = snapshot
@@ -804,14 +884,39 @@ class FocusDashboard:
                     summary = self.focus_engine.get_session_summary()
                     self.session_manager.save_session(snapshots, summary)
 
-            except Exception:
-                pass
+                consecutive_errors = 0
+
+            except Exception as e:
+                consecutive_errors += 1
+                log.error("Process loop error (#%d): %s", consecutive_errors, e)
+                if consecutive_errors >= 10 and self.camera_available:
+                    # Camera may have disconnected — try to reconnect
+                    log.warning("Too many errors, attempting webcam reconnect...")
+                    try:
+                        self.eye_tracker.stop()
+                        time.sleep(2)
+                        self.eye_tracker.start()
+                        self.camera_available = True
+                        consecutive_errors = 0
+                        log.info("Webcam reconnected successfully")
+                    except Exception:
+                        log.warning("Webcam reconnect failed, switching to activity-only mode")
+                        self.camera_available = False
+                        consecutive_errors = 0
             time.sleep(0.05)
 
     def _update_ui(self):
         if not self._running:
             return
 
+        try:
+            self._do_update_ui()
+        except Exception as e:
+            log.error("UI update error: %s", e)
+
+        self.root.after(self.UPDATE_INTERVAL_MS, self._update_ui)
+
+    def _do_update_ui(self):
         snap = self._latest_snapshot
         eye = self.eye_tracker.latest_metrics
         act = self.activity_monitor.latest_metrics
@@ -819,7 +924,7 @@ class FocusDashboard:
 
         # --- Top bar ---
         color = state_color(snap.state)
-        self.top_score_label.configure(text=f"{snap.focus_score:.0f}", text_color=color)
+        self._draw_score_ring(snap.focus_score, color)
         self.top_state_label.configure(text=snap.state, text_color=color)
 
         avg_5 = self.focus_engine.get_average_score(300)
@@ -852,8 +957,12 @@ class FocusDashboard:
             self.break_frame.grid_remove()
 
         # --- Camera ---
-        frame = self.eye_tracker.annotated_frame
-        if frame is not None:
+        if not self.camera_available:
+            self.camera_label.configure(
+                text="📷 Camera unavailable — activity-only mode",
+                image=None,
+            )
+        elif (frame := self.eye_tracker.annotated_frame) is not None:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
             img = img.resize((480, 360), Image.LANCZOS)
@@ -897,8 +1006,11 @@ class FocusDashboard:
                 bar.configure(progress_color=COLORS["distracted"])
 
         # --- Activity ---
+        class_icon = {"productive": "✅", "neutral": "➖", "distracting": "❌"}.get(
+            getattr(act, "app_classification", "neutral"), "➖"
+        )
         act_text = (
-            f"App: {act.active_app}  {'✅' if act.in_productive_app else '❌'}\n"
+            f"App: {act.active_app}  {class_icon} ({getattr(act, 'app_classification', 'neutral')})\n"
             f"Window: {act.active_window_title[:55]}\n"
             f"Keys/min: {act.keys_per_minute:.0f}  |  Mouse/min: {act.mouse_moves_per_minute:.0f}\n"
             f"Idle: {act.total_idle_seconds:.0f}s  |  Switches/min: {act.app_switches_per_minute:.0f}"
@@ -917,7 +1029,8 @@ class FocusDashboard:
                 )
             )
 
-        # --- Graph ---
-        self._draw_graph()
-
-        self.root.after(self.UPDATE_INTERVAL_MS, self._update_ui)
+        # --- Graph (throttled to 1/sec) ---
+        now = time.time()
+        if now - self._last_graph_draw >= 1.0:
+            self._draw_graph()
+            self._last_graph_draw = now

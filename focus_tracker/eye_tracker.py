@@ -140,6 +140,10 @@ class EyeTracker:
         self.annotated_frame = None
         self.latest_metrics = EyeMetrics()
 
+        # Face loss recovery: keep last-known metrics briefly when face disappears
+        self._face_lost_at: float | None = None
+        self._FACE_GRACE_PERIOD = 2.0  # seconds to keep last metrics after face loss
+
         self._running = False
 
     def start(self):
@@ -322,8 +326,36 @@ class EyeTracker:
 
             # --- Annotate frame ---
             self._annotate(frame, pts, metrics)
+
+            # Face recovered — reset grace period
+            self._face_lost_at = None
         else:
-            metrics.face_detected = False
+            # Face not detected — apply grace period
+            now = time.time()
+            if self._face_lost_at is None:
+                self._face_lost_at = now
+
+            elapsed = now - self._face_lost_at
+            if elapsed < self._FACE_GRACE_PERIOD and self.latest_metrics.face_detected:
+                # Within grace period: carry forward last-known metrics
+                metrics = EyeMetrics(
+                    timestamp=now,
+                    face_detected=True,
+                    left_ear=self.latest_metrics.left_ear,
+                    right_ear=self.latest_metrics.right_ear,
+                    avg_ear=self.latest_metrics.avg_ear,
+                    gaze_horizontal=self.latest_metrics.gaze_horizontal,
+                    gaze_vertical=self.latest_metrics.gaze_vertical,
+                    blinks_per_minute=self.latest_metrics.blinks_per_minute,
+                    head_yaw=self.latest_metrics.head_yaw,
+                    head_pitch=self.latest_metrics.head_pitch,
+                    attention_h=self.latest_metrics.attention_h,
+                    attention_v=self.latest_metrics.attention_v,
+                    looking_at_screen=self.latest_metrics.looking_at_screen,
+                    head_frontal_confidence=self.latest_metrics.head_frontal_confidence,
+                )
+            else:
+                metrics.face_detected = False
 
         self.annotated_frame = frame
         self.latest_metrics = metrics

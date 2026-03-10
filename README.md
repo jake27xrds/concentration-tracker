@@ -58,7 +58,7 @@ You'll need to grant these permissions (macOS will prompt you):
 source venv/bin/activate
 
 # Run the app
-python -m focus_tracker.main
+python -m focus_tracker
 ```
 
 ## How It Works
@@ -90,22 +90,30 @@ python -m focus_tracker.main
 
 | File | Purpose |
 |---|---|
-| `focus_tracker/eye_tracker.py` | Webcam eye tracking via MediaPipe Face Mesh |
-| `focus_tracker/activity_monitor.py` | Mouse, keyboard, and active window monitoring |
-| `focus_tracker/focus_engine.py` | Combines all signals into a 0–100 focus score |
-| `focus_tracker/dashboard.py` | Real-time CustomTkinter dashboard UI |
+| `focus_tracker/eye_tracker.py` | Webcam eye tracking via MediaPipe Face Mesh (head + eye fusion) |
+| `focus_tracker/activity_monitor.py` | Mouse, keyboard, and active window monitoring (3-tier app classification) |
+| `focus_tracker/focus_engine.py` | Combines all signals into a 0–100 focus score with hysteresis |
+| `focus_tracker/dashboard.py` | Real-time CustomTkinter dashboard UI with score ring |
+| `focus_tracker/config.py` | Settings persistence (saved to ~/Library/Application Support/FocusTracker/) |
+| `focus_tracker/alerts.py` | Distraction alerts and break reminders |
+| `focus_tracker/session_manager.py` | JSON session persistence and CSV export |
+| `focus_tracker/model_downloader.py` | Auto-downloads MediaPipe face model on first run |
 | `focus_tracker/main.py` | Entry point — wires everything together |
+| `tests/test_core.py` | Unit tests (18 tests covering engine, config, metrics) |
 
 ## Customization
 
-### Productive / Distracting Apps
+### App Classification (3 Tiers)
 
 Edit the app lists in `focus_tracker/activity_monitor.py`:
 
 ```python
-DEFAULT_PRODUCTIVE_APPS = {"code", "terminal", "safari", ...}
+DEFAULT_PRODUCTIVE_APPS = {"code", "terminal", "xcode", ...}
+DEFAULT_NEUTRAL_APPS = {"slack", "safari", "finder", ...}
 DEFAULT_DISTRACTING_APPS = {"tiktok", "netflix", ...}
 ```
+
+Settings are also persisted to `~/Library/Application Support/FocusTracker/settings.json`.
 
 ### Focus Score Weights
 
@@ -128,5 +136,14 @@ WEIGHTS = {
 | "Cannot open camera" | Check webcam connection and macOS Camera permissions |
 | No keyboard/mouse data | Grant Accessibility permission to your terminal app |
 | Active window shows "Unknown" | Grant Screen Recording permission |
+| Says "looking away" when you're not | Wait 2 seconds for auto-baseline to calibrate, or run manual calibration |
+| Score flickers between states | Hysteresis should handle this — if not, check lighting and camera angle |
+
+## Testing
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
 | Low FPS | Close other camera-using apps; check lighting |
 | Face not detected | Ensure good lighting and that your face is visible to the webcam |

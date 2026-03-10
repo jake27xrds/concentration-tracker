@@ -45,26 +45,35 @@ class ActivityMetrics:
     app_switches_per_minute: float = 0.0
     # Whether the user is in a "productive" app (configurable)
     in_productive_app: bool = True
+    # 3-tier classification: "productive", "neutral", "distracting"
+    app_classification: str = "productive"
 
 
 # Default set of apps considered "productive" — users can customize
 DEFAULT_PRODUCTIVE_APPS = {
     "code", "visual studio code", "xcode", "terminal", "iterm",
     "sublime text", "intellij", "pycharm", "webstorm",
-    "safari", "google chrome", "firefox", "arc",  # browsers can be productive
-    "finder", "preview", "notes", "pages", "keynote", "numbers",
+    "notes", "pages", "keynote", "numbers",
     "microsoft word", "microsoft excel", "microsoft powerpoint",
     "notion", "obsidian", "bear", "craft",
-    "slack", "microsoft teams", "zoom", "discord",
     "figma", "sketch", "affinity",
+}
+
+# Apps that are neither clearly productive nor clearly distracting
+DEFAULT_NEUTRAL_APPS = {
+    "slack", "microsoft teams", "zoom", "discord",
+    "messages", "imessage",
+    "finder", "preview",
+    "safari", "google chrome", "firefox", "arc",  # browsers could go either way
+    "mail", "outlook",
+    "calendar", "reminders",
 }
 
 # Apps that are almost always distracting
 DEFAULT_DISTRACTING_APPS = {
     "tiktok", "instagram", "facebook", "twitter",
-    "netflix", "youtube",  # youtube CAN be productive though
+    "netflix", "youtube",
     "steam", "epic games",
-    "messages", "imessage",
 }
 
 
@@ -72,9 +81,11 @@ class ActivityMonitor:
     """Monitors mouse, keyboard, and active window to gauge computer activity."""
 
     def __init__(self, productive_apps: set[str] | None = None,
-                 distracting_apps: set[str] | None = None):
+                 distracting_apps: set[str] | None = None,
+                 neutral_apps: set[str] | None = None):
         self.productive_apps = productive_apps or DEFAULT_PRODUCTIVE_APPS
         self.distracting_apps = distracting_apps or DEFAULT_DISTRACTING_APPS
+        self.neutral_apps = neutral_apps or DEFAULT_NEUTRAL_APPS
 
         # Mouse tracking
         self._mouse_moves: deque = deque(maxlen=500)
@@ -146,14 +157,20 @@ class ActivityMonitor:
             self._app_switches.popleft()
         metrics.app_switches_per_minute = len(self._app_switches)
 
-        # Productive app check
+        # 3-tier app classification
         app_lower = app_name.lower()
         if any(d in app_lower for d in self.distracting_apps):
             metrics.in_productive_app = False
+            metrics.app_classification = "distracting"
+        elif any(n in app_lower for n in self.neutral_apps):
+            metrics.in_productive_app = True
+            metrics.app_classification = "neutral"
         elif any(p in app_lower for p in self.productive_apps):
             metrics.in_productive_app = True
+            metrics.app_classification = "productive"
         else:
-            metrics.in_productive_app = True  # default: benefit of the doubt
+            metrics.in_productive_app = True
+            metrics.app_classification = "neutral"  # unknown apps default to neutral
 
         # --- Mouse ---
         while self._mouse_moves and self._mouse_moves[0] < cutoff:
@@ -172,8 +189,8 @@ class ActivityMonitor:
         metrics.keys_per_minute = len(self._key_presses)
         metrics.keyboard_idle_seconds = now - self._last_key_time
 
-        # --- Combined idle ---
-        metrics.total_idle_seconds = min(metrics.mouse_idle_seconds,
+        # --- Combined idle (time since ANY input) ---
+        metrics.total_idle_seconds = max(metrics.mouse_idle_seconds,
                                           metrics.keyboard_idle_seconds)
 
         self.latest_metrics = metrics
