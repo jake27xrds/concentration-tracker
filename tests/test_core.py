@@ -596,6 +596,14 @@ class TestConfig:
         cfg = load_config()
         assert "unknown_key" not in cfg
 
+    def test_nested_defaults_merge(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "settings.json"
+        config_file.write_text('{"calibration_profile": {"ear_baseline": 0.31}}')
+        monkeypatch.setattr("focus_tracker.config.CONFIG_FILE", config_file)
+        cfg = load_config()
+        assert cfg["calibration_profile"]["ear_baseline"] == 0.31
+        assert "blink_threshold" in cfg["calibration_profile"]
+
 
 # ══════════════════════════════════════════════
 # EyeMetrics tests
@@ -643,3 +651,112 @@ class TestFocusSnapshot:
         assert s.blink_score == 50.0
         assert s.activity_score == 50.0
         assert s.app_focus_score == 50.0
+
+
+# ══════════════════════════════════════════════
+# New feature tests (goals, nudges, profiles, analytics)
+# ══════════════════════════════════════════════
+
+class TestGoalTracking:
+    def test_goal_progress_counts_focused_states(self):
+        engine = FocusEngine(goal_minutes_target=1, goal_enabled=True)
+        t = time.time()
+        engine.calculate(_make_eye(timestamp=t), _make_activity(timestamp=t))
+        for i in range(1, 31):
+            engine.calculate(
+                _make_eye(timestamp=t + i),
+                _make_activity(timestamp=t + i, app_classification="productive"),
+            )
+        progress = engine.get_goal_progress()
+        assert progress["enabled"] is True
+        assert progress["focused_minutes"] > 0
+        assert 0 < progress["progress_pct"] <= 100
+
+
+class TestSmartNudges:
+    def test_high_switching_nudge_respects_cooldown(self):
+        am = AlertManager(sound_enabled=False, nudge_cooldowns_sec={"high_app_switching": 60})
+        t = time.time()
+        snap = FocusSnapshot(timestamp=t, state="Neutral", focus_score=55)
+        act = _make_activity(app_switches_per_minute=14)
+        state1 = am.update(snap, activity_metrics=act)
+        assert state1.nudge_active is True
+        assert state1.nudge_type == "high_app_switching"
+
+        state2 = am.update(FocusSnapshot(timestamp=t + 10, state="Neutral", focus_score=55), activity_metrics=act)
+        assert state2.nudge_type == "high_app_switching"
+        assert state2.nudge_last_fired_at == state1.nudge_last_fired_at
+
+
+class TestProfileClassification:
+    def test_domain_precedence_over_productive_app(self, monkeypatch):
+        monitor = ActivityMonitor(
+            profiles={
+                "Coding": {
+                    "productive_apps": ["safari"],
+                    "neutral_apps": [],
+                    "distracting_apps": [],
+                    "productive_domains": [],
+                    "distracting_domains": ["youtube.com"],
+                }
+            },
+            active_profile="Coding",
+        )
+        monkeypatch.setattr(
+            ActivityMonitor,
+            "_get_active_window",
+            staticmethod(lambda: ("Safari", "Lecture - youtube.com")),
+        )
+        metrics = monitor.get_metrics()
+        assert metrics.app_classification == "distracting"
+
+
+class TestSessionAnalytics:
+    def test_extended_snapshot_fields_persist(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("focus_tracker.session_manager.DATA_DIR", str(tmp_path))
+        sm = SessionManager()
+        snap = FocusSnapshot(
+            timestamp=time.time(),
+            focus_score=70,
+            state="Focused",
+            active_app="Code",
+            app_classification="productive",
+            profile_name="Coding",
+            active_domain="github.com",
+            is_reading=True,
+            goal_progress_pct=33.3,
+            nudge_reason="break_due",
+        )
+        sm.save_session([snap], {"avg_score": 70, "total_readings": 1})
+        data = json.loads(Path(sm.session_file).read_text())
+        row = data["snapshots"][0]
+        assert row["active_app"] == "Code"
+        assert row["profile_name"] == "Coding"
+        assert row["goal_progress_pct"] == 33.3
+        assert row["nudge_reason"] == "break_due"
+
+    def test_analytics_aggregations_return_data(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("focus_tracker.session_manager.DATA_DIR", str(tmp_path))
+        sm = SessionManager()
+        base = time.time()
+        snaps = []
+        for i in range(25):
+            snaps.append(
+                FocusSnapshot(
+                    timestamp=base + i,
+                    focus_score=35 if i < 8 else 75,
+                    state="Distracted" if i < 8 else "Focused",
+                    active_app="Safari" if i < 8 else "Code",
+                    app_classification="distracting" if i < 8 else "productive",
+                    profile_name="Coding",
+                    nudge_reason="prolonged_distraction" if i < 8 else "",
+                )
+            )
+        sm.save_session(snaps, {"avg_score": 60, "total_readings": len(snaps)})
+
+        hourly = sm.aggregate_hourly_focus(max_sessions=5)
+        impact = sm.aggregate_app_impact(max_sessions=5, top_n=5)
+        windows = sm.detect_distraction_windows(max_sessions=5, score_threshold=45, min_points=2)
+        assert len(hourly) >= 1
+        assert len(impact["top_apps"]) >= 1
+        assert len(windows) >= 1

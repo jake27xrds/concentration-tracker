@@ -6,6 +6,7 @@ and gaze direction via the webcam in real time.
 
 import time
 import math
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -249,6 +250,9 @@ class EyeTracker:
         self._baseline_gaze_h = 0.0
         self._baseline_gaze_v = 0.0
         self._baseline_locked = False
+        self._screen_h_thresh = 0.40
+        self._screen_v_thresh = 0.35
+        self.calibration_profile: dict = {}
 
         # Latest frame + annotated frame
         self.latest_frame = None
@@ -261,6 +265,7 @@ class EyeTracker:
 
         # Reading detector
         self._reading_detector = ReadingDetector()
+        self._calibration_session: dict | None = None
 
         self._running = False
 
@@ -295,50 +300,172 @@ class EyeTracker:
         Run a quick calibration: capture EAR samples for `duration` seconds
         while user looks at the screen with eyes open. Returns baseline EAR.
         """
+        self.start_calibration_session()
+        self.collect_calibration_sample("neutral", duration_s=duration)
+        profile = self.finalize_calibration()
+        if profile:
+            self.apply_calibration_profile(profile)
+        return self.baseline_ear
+
+    def start_calibration_session(self) -> None:
+        """Begin a multi-stage guided calibration capture session."""
+        self._calibration_session = {
+            "started_at": time.time(),
+            "stages": {
+                "neutral": [],
+                "reading": [],
+                "distracted": [],
+            },
+        }
+
+    def collect_calibration_sample(self, stage: str, duration_s: float = 30.0) -> dict:
+        """Collect one calibration stage worth of samples."""
         if not self._running:
-            return self.baseline_ear
+            return {"stage": stage, "samples": 0, "duration_s": 0.0}
+        if self._calibration_session is None:
+            self.start_calibration_session()
+        if stage not in self._calibration_session["stages"]:
+            raise ValueError(f"Unknown calibration stage: {stage}")
 
-        samples = []
+        prompts = {
+            "neutral": "CALIBRATING: Look at the screen naturally",
+            "reading": "CALIBRATING: Read text on-screen naturally",
+            "distracted": "CALIBRATING: Look away intermittently",
+        }
+
         start = time.time()
-        while time.time() - start < duration:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            self._frame_counter += 1
-            timestamp_ms = int(self._frame_counter * (1000 / 30))
-            results = self.landmarker.detect_for_video(mp_image, timestamp_ms)
+        collected = 0
+        while time.time() - start < duration_s:
+            metrics = self.process_frame()
+            if metrics.face_detected:
+                self._calibration_session["stages"][stage].append({
+                    "timestamp": metrics.timestamp,
+                    "avg_ear": metrics.avg_ear,
+                    "attention_h": metrics.attention_h,
+                    "attention_v": metrics.attention_v,
+                    "head_yaw": metrics.head_yaw,
+                    "head_pitch": metrics.head_pitch,
+                    "gaze_h": metrics.gaze_horizontal,
+                    "gaze_v": metrics.gaze_vertical,
+                    "reading_confidence": metrics.reading_confidence,
+                })
+                collected += 1
 
-            if results.face_landmarks:
-                landmarks = results.face_landmarks[0]
-                h, w, _ = frame.shape
-                pts = [(lm.x * w, lm.y * h, lm.z * w) for lm in landmarks]
-                left_ear = self._ear_from_pairs(pts, LEFT_EAR_PAIRS, LEFT_EYE_OUTER, LEFT_EYE_INNER)
-                right_ear = self._ear_from_pairs(pts, RIGHT_EAR_PAIRS, RIGHT_EYE_OUTER, RIGHT_EYE_INNER)
-                avg = (left_ear + right_ear) / 2
-                if avg > 0.1:  # filter out blinks during calibration
-                    samples.append(avg)
-
-            # Show calibration frame
-            cv2.putText(frame, "CALIBRATING - Look at screen normally",
-                        (50, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            progress = min(1.0, (time.time() - start) / duration)
-            bar_w = int(540 * progress)
-            cv2.rectangle(frame, (50, 60), (50 + bar_w, 75), (0, 255, 0), -1)
-            cv2.rectangle(frame, (50, 60), (590, 75), (255, 255, 255), 1)
-            self.annotated_frame = frame
+            frame = self.annotated_frame if self.annotated_frame is not None else self.latest_frame
+            if frame is not None:
+                cv2.putText(frame, prompts.get(stage, "CALIBRATING"),
+                            (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                progress = min(1.0, (time.time() - start) / duration_s)
+                bar_w = int(540 * progress)
+                cv2.rectangle(frame, (50, 60), (50 + bar_w, 75), (0, 255, 0), -1)
+                cv2.rectangle(frame, (50, 60), (590, 75), (255, 255, 255), 1)
+                self.annotated_frame = frame
             time.sleep(0.03)
 
-        if len(samples) >= 10:
-            self.baseline_ear = sum(samples) / len(samples)
-            # Set thresholds relative to the user's baseline
-            self.EAR_BLINK_THRESHOLD = self.baseline_ear * 0.75
-            self.EAR_CLOSED_THRESHOLD = self.baseline_ear * 0.65
-            self.calibrated = True
+        return {
+            "stage": stage,
+            "samples": collected,
+            "duration_s": round(time.time() - start, 2),
+        }
 
-        return self.baseline_ear
+    def finalize_calibration(self) -> dict:
+        """Compute calibration profile from staged samples."""
+        if self._calibration_session is None:
+            return {}
+
+        neutral = self._calibration_session["stages"].get("neutral", [])
+        reading = self._calibration_session["stages"].get("reading", [])
+        distracted = self._calibration_session["stages"].get("distracted", [])
+        if len(neutral) < 10:
+            return {}
+
+        ear_vals = [s["avg_ear"] for s in neutral if s["avg_ear"] > 0.1]
+        att_h = [s["attention_h"] for s in neutral]
+        att_v = [s["attention_v"] for s in neutral]
+        head_y = [s.get("head_yaw", 0.0) for s in neutral]
+        head_p = [s.get("head_pitch", 0.0) for s in neutral]
+        gaze_h = [s.get("gaze_h", 0.0) for s in neutral]
+        gaze_v = [s.get("gaze_v", 0.0) for s in neutral]
+        center_h = sum(att_h) / len(att_h) if att_h else 0.0
+        center_v = sum(att_v) / len(att_v) if att_v else 0.0
+
+        # Keep tolerance generous to reduce false "away" states.
+        tol_h = max(0.35, max(abs(v - center_h) for v in att_h) + 0.10) if att_h else 0.45
+        tol_v = max(0.30, max(abs(v - center_v) for v in att_v) + 0.10) if att_v else 0.40
+
+        read_conf = [s["reading_confidence"] for s in reading]
+        read_h = [s["gaze_h"] for s in reading]
+        read_v = [s["gaze_v"] for s in reading]
+        dis_mag = [
+            math.sqrt(s["attention_h"] ** 2 + s["attention_v"] ** 2)
+            for s in distracted
+        ]
+
+        def _variance(vals: list[float]) -> float:
+            if len(vals) < 2:
+                return 0.0
+            mean = sum(vals) / len(vals)
+            return sum((v - mean) ** 2 for v in vals) / len(vals)
+
+        baseline_ear = sum(ear_vals) / len(ear_vals) if ear_vals else self.baseline_ear
+        profile = {
+            "neutral_attention_center": [round(center_h, 4), round(center_v, 4)],
+            "neutral_attention_tolerance": [round(tol_h, 4), round(tol_v, 4)],
+            "neutral_head_center": [
+                round(sum(head_y) / len(head_y), 4) if head_y else 0.0,
+                round(sum(head_p) / len(head_p), 4) if head_p else 0.0,
+            ],
+            "neutral_gaze_center": [
+                round(sum(gaze_h) / len(gaze_h), 4) if gaze_h else 0.0,
+                round(sum(gaze_v) / len(gaze_v), 4) if gaze_v else 0.0,
+            ],
+            "reading_baseline": {
+                "confidence": round(sum(read_conf) / len(read_conf), 4) if read_conf else 0.0,
+                "gaze_horizontal_variance": round(_variance(read_h), 6),
+                "gaze_vertical_variance": round(_variance(read_v), 6),
+            },
+            "distracted_baseline": {
+                "attention_magnitude": round(sum(dis_mag) / len(dis_mag), 4) if dis_mag else 0.0,
+            },
+            "ear_baseline": round(baseline_ear, 4),
+            "blink_threshold": round(baseline_ear * 0.75, 4),
+            "closed_threshold": round(baseline_ear * 0.65, 4),
+            "calibrated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.calibration_profile = profile
+        return profile
+
+    def apply_calibration_profile(self, profile: dict) -> None:
+        """Apply persisted calibration profile to runtime thresholds."""
+        if not profile:
+            return
+        self.calibration_profile = profile
+        self.baseline_ear = float(profile.get("ear_baseline", self.baseline_ear))
+        self.EAR_BLINK_THRESHOLD = float(profile.get("blink_threshold", self.EAR_BLINK_THRESHOLD))
+        self.EAR_CLOSED_THRESHOLD = float(profile.get("closed_threshold", self.EAR_CLOSED_THRESHOLD))
+
+        head_center = profile.get("neutral_head_center")
+        gaze_center = profile.get("neutral_gaze_center")
+        tol = profile.get("neutral_attention_tolerance", [0.40, 0.35])
+        if isinstance(head_center, (list, tuple)) and len(head_center) >= 2:
+            self._baseline_yaw = float(head_center[0])
+            self._baseline_pitch = float(head_center[1])
+            if isinstance(gaze_center, (list, tuple)) and len(gaze_center) >= 2:
+                self._baseline_gaze_h = float(gaze_center[0])
+                self._baseline_gaze_v = float(gaze_center[1])
+            else:
+                self._baseline_gaze_h = 0.0
+                self._baseline_gaze_v = 0.0
+            self._baseline_locked = True
+        else:
+            # Older profile format: keep auto-baseline behavior instead of
+            # incorrectly mapping attention-center to raw head baselines.
+            self._baseline_locked = False
+            self._baseline_samples.clear()
+        if isinstance(tol, (list, tuple)) and len(tol) >= 2:
+            self._screen_h_thresh = float(tol[0])
+            self._screen_v_thresh = float(tol[1])
+        self.calibrated = True
 
     def stop(self):
         """Release resources."""
@@ -638,11 +765,9 @@ class EyeTracker:
             sum(self._attention_v_buffer) / len(self._attention_v_buffer), -1, 1))
 
         # "Looking at screen" = combined attention roughly centered
-        screen_h_thresh = 0.40
-        screen_v_thresh = 0.35
         metrics.looking_at_screen = (
-            abs(metrics.attention_h) < screen_h_thresh
-            and abs(metrics.attention_v) < screen_v_thresh
+            abs(metrics.attention_h) < self._screen_h_thresh
+            and abs(metrics.attention_v) < self._screen_v_thresh
         )
 
     @staticmethod

@@ -10,6 +10,7 @@ import time
 import threading
 import subprocess
 import logging
+import math
 import tkinter as tk
 from collections import deque
 from datetime import datetime
@@ -31,22 +32,22 @@ log = logging.getLogger("focus_tracker.dashboard")
 
 # Color scheme
 COLORS = {
-    "deep_focus": "#22c55e",   # green
-    "focused": "#84cc16",      # lime
-    "neutral": "#eab308",      # yellow
+    "deep_focus": "#10b981",   # emerald
+    "focused": "#34d399",      # light emerald
+    "neutral": "#f59e0b",      # amber
     "distracted": "#f97316",   # orange
     "away": "#ef4444",         # red
-    "bg_dark": "#1a1a2e",
-    "bg_card": "#16213e",
-    "bg_card_alt": "#1e2a47",
-    "text": "#e2e8f0",
-    "text_dim": "#94a3b8",
-    "accent": "#7c3aed",
-    "accent_light": "#a78bfa",
-    "graph_bg": "#0f172a",
-    "graph_grid": "#1e293b",
-    "alert_bg": "#7f1d1d",
-    "break_bg": "#164e63",
+    "bg_dark": "#0f0f0f",      # near-black
+    "bg_card": "#181818",      # dark card
+    "bg_card_alt": "#202020",  # card hover
+    "text": "#f5f5f5",
+    "text_dim": "#737373",
+    "accent": "#3b82f6",       # clean blue
+    "accent_light": "#93c5fd",
+    "graph_bg": "#0a0a0a",
+    "graph_grid": "#1e1e1e",
+    "alert_bg": "#3b0000",
+    "break_bg": "#001a33",
 }
 
 
@@ -81,6 +82,7 @@ class FocusDashboard:
         self._alert_state = AlertState()
         self._running = False
         self._calibrating = False
+        self._calibration_stage_results: dict[str, dict] = {}
 
         # Graph data buffer
         self._graph_scores: deque = deque(maxlen=600)  # 10 min at 1/sec
@@ -92,9 +94,9 @@ class FocusDashboard:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("Focus Tracker — Concentration Monitor")
-        self.root.geometry("1200x800")
-        self.root.minsize(1000, 650)
+        self.root.title("Focus")
+        self.root.geometry("1280x820")
+        self.root.minsize(1060, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_layout()
@@ -112,105 +114,128 @@ class FocusDashboard:
         self.tabview = ctk.CTkTabview(self.root, fg_color=COLORS["bg_dark"],
                                        segmented_button_fg_color=COLORS["bg_card"],
                                        segmented_button_selected_color=COLORS["accent"],
-                                       segmented_button_unselected_color=COLORS["bg_card_alt"])
-        self.tabview.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+                                       segmented_button_unselected_color=COLORS["bg_card_alt"],
+                                       segmented_button_selected_hover_color=COLORS["accent"],
+                                       segmented_button_unselected_hover_color=COLORS["bg_card_alt"])
+        self.tabview.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="nsew")
 
-        self.tab_live = self.tabview.add("🎯 Live")
-        self.tab_graph = self.tabview.add("📈 Timeline")
-        self.tab_history = self.tabview.add("📊 History")
-        self.tab_settings = self.tabview.add("⚙️ Settings")
+        self.tab_live = self.tabview.add("  Live  ")
+        self.tab_graph = self.tabview.add("  Timeline  ")
+        self.tab_history = self.tabview.add("  History  ")
+        self.tab_settings = self.tabview.add("  Settings  ")
+        self.tab_analytics = self.tabview.add("  Analytics  ")
 
         self._build_live_tab()
         self._build_graph_tab()
         self._build_history_tab()
         self._build_settings_tab()
+        self._build_analytics_tab()
 
     # ---- TOP BAR ----
 
     def _build_top_bar(self):
-        top = ctk.CTkFrame(self.root, fg_color=COLORS["bg_card"], height=90, corner_radius=0)
+        top = ctk.CTkFrame(self.root, fg_color=COLORS["bg_card"], height=80, corner_radius=0)
         top.grid(row=0, column=0, sticky="ew")
         top.grid_columnconfigure(2, weight=1)
 
-        # Score circle
+        # Score ring
         score_frame = ctk.CTkFrame(top, fg_color="transparent")
-        score_frame.grid(row=0, column=0, padx=15, pady=8)
+        score_frame.grid(row=0, column=0, padx=(20, 12), pady=10)
 
-        # Score ring canvas
         self.score_canvas = tk.Canvas(
-            score_frame, width=90, height=90,
+            score_frame, width=56, height=56,
             bg=COLORS["bg_card"], highlightthickness=0
         )
         self.score_canvas.grid(row=0, column=0)
 
+        # State + stats side by side
+        stats_frame = ctk.CTkFrame(top, fg_color="transparent")
+        stats_frame.grid(row=0, column=1, padx=0, pady=10, sticky="w")
+
         self.top_state_label = ctk.CTkLabel(
-            score_frame, text="Neutral",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            stats_frame, text="Neutral",
+            font=ctk.CTkFont(size=18, weight="bold"),
             text_color=COLORS["neutral"]
         )
-        self.top_state_label.grid(row=1, column=0)
+        self.top_state_label.grid(row=0, column=0, sticky="w")
 
-        # Stats
-        stats_frame = ctk.CTkFrame(top, fg_color="transparent")
-        stats_frame.grid(row=0, column=1, padx=15, pady=8)
+        meta_frame = ctk.CTkFrame(stats_frame, fg_color="transparent")
+        meta_frame.grid(row=1, column=0, sticky="w")
 
-        self.avg_label = ctk.CTkLabel(stats_frame, text="5-min avg: --",
-                                       font=ctk.CTkFont(size=13), text_color=COLORS["text_dim"])
-        self.avg_label.grid(row=0, column=0, sticky="w")
+        self.avg_label = ctk.CTkLabel(meta_frame, text="avg --",
+                                       font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"])
+        self.avg_label.grid(row=0, column=0, padx=(0, 16), sticky="w")
 
-        self.streak_label = ctk.CTkLabel(stats_frame, text="Streak: 0m",
-                                          font=ctk.CTkFont(size=13), text_color=COLORS["text_dim"])
-        self.streak_label.grid(row=1, column=0, sticky="w")
+        self.streak_label = ctk.CTkLabel(meta_frame, text="streak 0m",
+                                          font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"])
+        self.streak_label.grid(row=0, column=1, padx=(0, 16), sticky="w")
 
-        self.session_time_label = ctk.CTkLabel(stats_frame, text="Session: 0:00",
-                                                font=ctk.CTkFont(size=13),
+        self.session_time_label = ctk.CTkLabel(meta_frame, text="0:00",
+                                                font=ctk.CTkFont(size=12),
                                                 text_color=COLORS["text_dim"])
-        self.session_time_label.grid(row=2, column=0, sticky="w")
+        self.session_time_label.grid(row=0, column=2, padx=(0, 16), sticky="w")
 
-        self.reading_label = ctk.CTkLabel(stats_frame, text="",
-                                           font=ctk.CTkFont(size=13, weight="bold"),
+        self.reading_label = ctk.CTkLabel(meta_frame, text="",
+                                           font=ctk.CTkFont(size=12),
                                            text_color=COLORS["accent_light"])
-        self.reading_label.grid(row=3, column=0, sticky="w")
+        self.reading_label.grid(row=0, column=3, sticky="w")
+
+        # Goal progress (compact)
+        goal_frame = ctk.CTkFrame(top, fg_color="transparent")
+        goal_frame.grid(row=0, column=3, padx=20, pady=10, sticky="e")
+
+        self.goal_label = ctk.CTkLabel(goal_frame, text="Goal: --",
+                                       font=ctk.CTkFont(size=11),
+                                       text_color=COLORS["text_dim"])
+        self.goal_label.grid(row=0, column=0, sticky="w")
+
+        self.goal_progress = ctk.CTkProgressBar(goal_frame, width=140, height=4,
+                                                progress_color=COLORS["deep_focus"],
+                                                fg_color=COLORS["bg_card_alt"])
+        self.goal_progress.grid(row=1, column=0, pady=(3, 0), sticky="w")
+        self.goal_progress.set(0)
 
         # Alert banner
         self.alert_frame = ctk.CTkFrame(top, fg_color=COLORS["alert_bg"],
-                                         corner_radius=8, height=40)
-        self.alert_frame.grid(row=0, column=2, padx=15, pady=12, sticky="ew")
-        self.alert_frame.grid_remove()  # hidden by default
+                                         corner_radius=6, height=36)
+        self.alert_frame.grid(row=0, column=2, padx=16, pady=20, sticky="ew")
+        self.alert_frame.grid_remove()
 
         self.alert_label = ctk.CTkLabel(
             self.alert_frame, text="",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=12),
             text_color="#fca5a5"
         )
-        self.alert_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        self.alert_label.grid(row=0, column=0, padx=10, pady=4, sticky="w")
 
         self.alert_dismiss_btn = ctk.CTkButton(
-            self.alert_frame, text="Dismiss", width=70, height=28,
-            font=ctk.CTkFont(size=11), fg_color="#991b1b",
+            self.alert_frame, text="Dismiss", width=64, height=24,
+            font=ctk.CTkFont(size=11), fg_color="#6b0f0f",
+            hover_color="#7f1d1d",
             command=self._dismiss_alert
         )
-        self.alert_dismiss_btn.grid(row=0, column=1, padx=5, pady=5)
+        self.alert_dismiss_btn.grid(row=0, column=1, padx=6, pady=4)
 
-        # Break banner (separate from distraction alert)
+        # Break banner
         self.break_frame = ctk.CTkFrame(top, fg_color=COLORS["break_bg"],
-                                         corner_radius=8, height=40)
-        self.break_frame.grid(row=0, column=2, padx=15, pady=12, sticky="ew")
+                                         corner_radius=6, height=36)
+        self.break_frame.grid(row=0, column=2, padx=16, pady=20, sticky="ew")
         self.break_frame.grid_remove()
 
         self.break_label = ctk.CTkLabel(
             self.break_frame, text="",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#67e8f9"
+            font=ctk.CTkFont(size=12),
+            text_color="#7dd3fc"
         )
-        self.break_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        self.break_label.grid(row=0, column=0, padx=10, pady=4, sticky="w")
 
         self.break_btn = ctk.CTkButton(
-            self.break_frame, text="Take Break", width=80, height=28,
-            font=ctk.CTkFont(size=11), fg_color="#155e75",
+            self.break_frame, text="Take Break", width=80, height=24,
+            font=ctk.CTkFont(size=11), fg_color="#0c3d5e",
+            hover_color="#0e4f78",
             command=self._take_break
         )
-        self.break_btn.grid(row=0, column=1, padx=5, pady=5)
+        self.break_btn.grid(row=0, column=1, padx=6, pady=4)
 
     # ---- LIVE TAB ----
 
@@ -221,97 +246,98 @@ class FocusDashboard:
         tab.grid_rowconfigure(0, weight=1)
 
         # Left: Camera
-        left = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=12)
-        left.grid(row=0, column=0, padx=(5, 5), pady=5, sticky="nsew")
+        left = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
+        left.grid(row=0, column=0, padx=(6, 4), pady=6, sticky="nsew")
         left.grid_rowconfigure(1, weight=1)
         left.grid_columnconfigure(0, weight=1)
 
-        cam_title = ctk.CTkLabel(left, text="👁  Eye Tracking",
-                                  font=ctk.CTkFont(size=15, weight="bold"),
-                                  text_color=COLORS["text"])
-        cam_title.grid(row=0, column=0, padx=10, pady=(8, 2), sticky="w")
+        cam_title = ctk.CTkLabel(left, text="Eye Tracking",
+                                  font=ctk.CTkFont(size=13, weight="bold"),
+                                  text_color=COLORS["text_dim"])
+        cam_title.grid(row=0, column=0, padx=14, pady=(12, 4), sticky="w")
 
         self.camera_label = ctk.CTkLabel(left, text="Starting camera...")
         self.camera_label.grid(row=1, column=0, padx=8, pady=4, sticky="nsew")
 
-        eye_info = ctk.CTkFrame(left, fg_color=COLORS["bg_dark"], corner_radius=8)
-        eye_info.grid(row=2, column=0, padx=8, pady=(2, 8), sticky="ew")
+        eye_info = ctk.CTkFrame(left, fg_color=COLORS["bg_dark"], corner_radius=6)
+        eye_info.grid(row=2, column=0, padx=10, pady=(4, 10), sticky="ew")
 
         self.eye_info_label = ctk.CTkLabel(
             eye_info, text="Waiting for data...",
             font=ctk.CTkFont(family="Menlo", size=11),
             text_color=COLORS["text_dim"], justify="left", anchor="w"
         )
-        self.eye_info_label.grid(row=0, column=0, padx=8, pady=6, sticky="w")
+        self.eye_info_label.grid(row=0, column=0, padx=10, pady=8, sticky="w")
 
         # Right: Components + Activity
-        right = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=12)
-        right.grid(row=0, column=1, padx=(5, 5), pady=5, sticky="nsew")
+        right = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
+        right.grid(row=0, column=1, padx=(4, 6), pady=6, sticky="nsew")
         right.grid_rowconfigure(2, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
         # Component bars
-        comp_title = ctk.CTkLabel(right, text="📊  Score Breakdown",
-                                   font=ctk.CTkFont(size=15, weight="bold"),
-                                   text_color=COLORS["text"])
-        comp_title.grid(row=0, column=0, padx=10, pady=(8, 4), sticky="w")
+        comp_title = ctk.CTkLabel(right, text="Score Breakdown",
+                                   font=ctk.CTkFont(size=13, weight="bold"),
+                                   text_color=COLORS["text_dim"])
+        comp_title.grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
 
-        comp_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_dark"], corner_radius=8)
-        comp_frame.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
+        comp_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_dark"], corner_radius=6)
+        comp_frame.grid(row=1, column=0, padx=10, pady=(0, 6), sticky="ew")
         comp_frame.grid_columnconfigure(1, weight=1)
 
         self.component_bars = {}
         component_names = [
-            ("eye_engagement", "👁  Eye Engagement"),
-            ("gaze_stability", "🎯  Gaze Stability"),
-            ("blink", "😑  Blink Pattern"),
-            ("activity", "⌨️  Computer Activity"),
-            ("app_focus", "🖥  App Focus"),
+            ("eye_engagement", "Eye Engagement"),
+            ("gaze_stability", "Gaze Stability"),
+            ("blink", "Blink Pattern"),
+            ("activity", "Activity"),
+            ("app_focus", "App Focus"),
         ]
         for i, (key, label) in enumerate(component_names):
-            lbl = ctk.CTkLabel(comp_frame, text=label, font=ctk.CTkFont(size=12),
+            lbl = ctk.CTkLabel(comp_frame, text=label, font=ctk.CTkFont(size=11),
                                text_color=COLORS["text_dim"])
-            lbl.grid(row=i, column=0, padx=(10, 5), pady=4, sticky="w")
+            lbl.grid(row=i, column=0, padx=(12, 8), pady=5, sticky="w")
 
-            bar = ctk.CTkProgressBar(comp_frame, height=16, corner_radius=4,
-                                      progress_color=COLORS["accent"])
-            bar.grid(row=i, column=1, padx=(0, 5), pady=4, sticky="ew")
+            bar = ctk.CTkProgressBar(comp_frame, height=6, corner_radius=3,
+                                      progress_color=COLORS["accent"],
+                                      fg_color=COLORS["bg_card_alt"])
+            bar.grid(row=i, column=1, padx=(0, 6), pady=5, sticky="ew")
             bar.set(0.5)
 
             val = ctk.CTkLabel(comp_frame, text="50",
-                               font=ctk.CTkFont(family="Menlo", size=12, weight="bold"),
-                               text_color=COLORS["text"], width=35)
-            val.grid(row=i, column=2, padx=(0, 10), pady=4)
+                               font=ctk.CTkFont(family="Menlo", size=11),
+                               text_color=COLORS["text"], width=32)
+            val.grid(row=i, column=2, padx=(0, 12), pady=5)
 
             self.component_bars[key] = (bar, val)
 
         # Activity info
-        act_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_dark"], corner_radius=8)
-        act_frame.grid(row=2, column=0, padx=8, pady=4, sticky="nsew")
+        act_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_dark"], corner_radius=6)
+        act_frame.grid(row=2, column=0, padx=10, pady=6, sticky="nsew")
         act_frame.grid_columnconfigure(0, weight=1)
 
-        act_title = ctk.CTkLabel(act_frame, text="💻  Activity Details",
-                                  font=ctk.CTkFont(size=14, weight="bold"),
-                                  text_color=COLORS["text"])
-        act_title.grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
+        act_title = ctk.CTkLabel(act_frame, text="Activity",
+                                  font=ctk.CTkFont(size=13, weight="bold"),
+                                  text_color=COLORS["text_dim"])
+        act_title.grid(row=0, column=0, padx=12, pady=(10, 4), sticky="w")
 
         self.activity_label = ctk.CTkLabel(
             act_frame, text="Waiting...",
             font=ctk.CTkFont(family="Menlo", size=11),
             text_color=COLORS["text_dim"], justify="left", anchor="nw"
         )
-        self.activity_label.grid(row=1, column=0, padx=10, pady=(2, 6), sticky="nw")
+        self.activity_label.grid(row=1, column=0, padx=12, pady=(0, 8), sticky="nw")
 
         # Session summary bar
-        summary_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_dark"], corner_radius=8)
-        summary_frame.grid(row=3, column=0, padx=8, pady=(4, 8), sticky="ew")
+        summary_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_dark"], corner_radius=6)
+        summary_frame.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="ew")
 
         self.summary_label = ctk.CTkLabel(
-            summary_frame, text="Session: starting...",
-            font=ctk.CTkFont(size=12), text_color=COLORS["text_dim"],
+            summary_frame, text="Session starting...",
+            font=ctk.CTkFont(size=11), text_color=COLORS["text_dim"],
             justify="left", anchor="w"
         )
-        self.summary_label.grid(row=0, column=0, padx=10, pady=6, sticky="w")
+        self.summary_label.grid(row=0, column=0, padx=12, pady=8, sticky="w")
 
     # ---- GRAPH TAB ----
 
@@ -322,23 +348,23 @@ class FocusDashboard:
 
         # Controls
         ctrl = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=8)
-        ctrl.grid(row=0, column=0, padx=5, pady=(5, 2), sticky="ew")
+        ctrl.grid(row=0, column=0, padx=6, pady=(6, 3), sticky="ew")
 
-        ctk.CTkLabel(ctrl, text="📈 Focus Timeline",
-                     font=ctk.CTkFont(size=15, weight="bold"),
-                     text_color=COLORS["text"]).grid(row=0, column=0, padx=10, pady=6)
+        ctk.CTkLabel(ctrl, text="Timeline",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text_dim"]).grid(row=0, column=0, padx=14, pady=8)
 
         self.graph_range_var = ctk.StringVar(value="5 min")
         graph_range = ctk.CTkSegmentedButton(
             ctrl, values=["1 min", "5 min", "10 min", "30 min"],
             variable=self.graph_range_var,
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=11),
         )
-        graph_range.grid(row=0, column=1, padx=10, pady=6)
+        graph_range.grid(row=0, column=1, padx=10, pady=8)
 
         # Canvas for graph
         graph_frame = ctk.CTkFrame(tab, fg_color=COLORS["graph_bg"], corner_radius=8)
-        graph_frame.grid(row=1, column=0, padx=5, pady=(2, 5), sticky="nsew")
+        graph_frame.grid(row=1, column=0, padx=6, pady=3, sticky="nsew")
         graph_frame.grid_columnconfigure(0, weight=1)
         graph_frame.grid_rowconfigure(0, weight=1)
 
@@ -349,7 +375,7 @@ class FocusDashboard:
 
         # Legend
         legend = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=8)
-        legend.grid(row=2, column=0, padx=5, pady=(2, 5), sticky="ew")
+        legend.grid(row=2, column=0, padx=6, pady=(3, 6), sticky="ew")
 
         for i, (state, clr) in enumerate([
             ("Deep Focus", COLORS["deep_focus"]),
@@ -358,10 +384,10 @@ class FocusDashboard:
             ("Distracted", COLORS["distracted"]),
             ("Away", COLORS["away"]),
         ]):
-            ctk.CTkLabel(legend, text="●", text_color=clr,
-                         font=ctk.CTkFont(size=14)).grid(row=0, column=i * 2, padx=(10, 2), pady=4)
+            ctk.CTkLabel(legend, text="─", text_color=clr,
+                         font=ctk.CTkFont(size=14)).grid(row=0, column=i * 2, padx=(12, 2), pady=6)
             ctk.CTkLabel(legend, text=state, text_color=COLORS["text_dim"],
-                         font=ctk.CTkFont(size=11)).grid(row=0, column=i * 2 + 1, padx=(0, 8), pady=4)
+                         font=ctk.CTkFont(size=11)).grid(row=0, column=i * 2 + 1, padx=(0, 10), pady=6)
 
     # ---- HISTORY TAB ----
 
@@ -371,25 +397,27 @@ class FocusDashboard:
         tab.grid_rowconfigure(1, weight=1)
 
         ctrl = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=8)
-        ctrl.grid(row=0, column=0, padx=5, pady=(5, 2), sticky="ew")
+        ctrl.grid(row=0, column=0, padx=6, pady=(6, 3), sticky="ew")
 
-        ctk.CTkLabel(ctrl, text="📊 Past Sessions",
-                     font=ctk.CTkFont(size=15, weight="bold"),
-                     text_color=COLORS["text"]).grid(row=0, column=0, padx=10, pady=6)
+        ctk.CTkLabel(ctrl, text="History",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text_dim"]).grid(row=0, column=0, padx=14, pady=8)
 
-        export_btn = ctk.CTkButton(ctrl, text="Export Current as CSV", width=160,
+        export_btn = ctk.CTkButton(ctrl, text="Export CSV", width=110,
+                                    height=30, font=ctk.CTkFont(size=12),
                                     command=self._export_csv)
-        export_btn.grid(row=0, column=1, padx=10, pady=6)
+        export_btn.grid(row=0, column=1, padx=8, pady=8)
 
         refresh_btn = ctk.CTkButton(ctrl, text="Refresh", width=80,
+                                     height=30, font=ctk.CTkFont(size=12),
                                      command=self._refresh_history)
-        refresh_btn.grid(row=0, column=2, padx=5, pady=6)
+        refresh_btn.grid(row=0, column=2, padx=4, pady=8)
 
         # Scrollable history list
         self.history_scroll = ctk.CTkScrollableFrame(
             tab, fg_color=COLORS["bg_dark"], corner_radius=8
         )
-        self.history_scroll.grid(row=1, column=0, padx=5, pady=(2, 5), sticky="nsew")
+        self.history_scroll.grid(row=1, column=0, padx=6, pady=(3, 6), sticky="nsew")
         self.history_scroll.grid_columnconfigure(0, weight=1)
 
         self.history_status_label = ctk.CTkLabel(
@@ -403,21 +431,29 @@ class FocusDashboard:
     def _build_settings_tab(self):
         tab = self.tab_settings
         tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
 
-        title = ctk.CTkLabel(tab, text="⚙️  Settings",
-                             font=ctk.CTkFont(size=18, weight="bold"),
+        self.settings_scroll = ctk.CTkScrollableFrame(
+            tab, fg_color=COLORS["bg_dark"], corner_radius=8
+        )
+        self.settings_scroll.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self.settings_scroll.grid_columnconfigure(0, weight=1)
+        tab = self.settings_scroll
+
+        title = ctk.CTkLabel(tab, text="Settings",
+                             font=ctk.CTkFont(size=16, weight="bold"),
                              text_color=COLORS["text"])
-        title.grid(row=0, column=0, padx=15, pady=(10, 5), sticky="w")
+        title.grid(row=0, column=0, padx=16, pady=(14, 6), sticky="w")
 
         # Alert settings
         alert_frame = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
-        alert_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+        alert_frame.grid(row=1, column=0, padx=12, pady=5, sticky="ew")
         alert_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(alert_frame, text="Alerts & Reminders",
-                     font=ctk.CTkFont(size=14, weight="bold"),
+                     font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=COLORS["text"]).grid(row=0, column=0, columnspan=2,
-                                                      padx=12, pady=(10, 5), sticky="w")
+                                                      padx=14, pady=(12, 6), sticky="w")
 
         # Sound toggle
         ctk.CTkLabel(alert_frame, text="Alert sounds",
@@ -448,33 +484,120 @@ class FocusDashboard:
                                        text_color=COLORS["text"], width=40)
         self.break_val.grid(row=3, column=2, padx=(0, 12), pady=(4, 12))
 
+        # Goal settings
+        goal_frame = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
+        goal_frame.grid(row=2, column=0, padx=12, pady=5, sticky="ew")
+        goal_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(goal_frame, text="Session Goal",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text"]).grid(row=0, column=0, columnspan=3,
+                                                      padx=14, pady=(12, 6), sticky="w")
+
+        self.goal_enabled_var = ctk.BooleanVar(value=True)
+        ctk.CTkLabel(goal_frame, text="Enable goal",
+                     text_color=COLORS["text_dim"]).grid(row=1, column=0, padx=12, pady=4, sticky="w")
+        ctk.CTkSwitch(goal_frame, text="", variable=self.goal_enabled_var).grid(
+            row=1, column=1, padx=12, pady=4, sticky="w"
+        )
+
+        ctk.CTkLabel(goal_frame, text="Focused minutes target",
+                     text_color=COLORS["text_dim"]).grid(row=2, column=0, padx=12, pady=4, sticky="w")
+        self.goal_slider = ctk.CTkSlider(goal_frame, from_=15, to=180, number_of_steps=33)
+        self.goal_slider.set(45)
+        self.goal_slider.grid(row=2, column=1, padx=12, pady=4, sticky="ew")
+        self.goal_val = ctk.CTkLabel(goal_frame, text="45m",
+                                     text_color=COLORS["text"], width=50)
+        self.goal_val.grid(row=2, column=2, padx=(0, 12), pady=4)
+
+        ctk.CTkButton(goal_frame, text="Reset Goal Progress", width=150,
+                       command=self._reset_goal_progress).grid(
+            row=3, column=0, padx=12, pady=(4, 12), sticky="w"
+        )
+
+        # Profile settings
+        profile_frame = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
+        profile_frame.grid(row=3, column=0, padx=12, pady=5, sticky="ew")
+        profile_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(profile_frame, text="Focus Profiles",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text"]).grid(row=0, column=0, columnspan=2,
+                                                      padx=14, pady=(12, 6), sticky="w")
+
+        ctk.CTkLabel(profile_frame, text="Active profile",
+                     text_color=COLORS["text_dim"]).grid(row=1, column=0, padx=12, pady=4, sticky="w")
+        self.profile_var = ctk.StringVar(value="Coding")
+        self.profile_menu = ctk.CTkOptionMenu(
+            profile_frame,
+            values=["Study", "Coding", "Writing"],
+            variable=self.profile_var,
+            command=lambda _: self._on_profile_change(),
+        )
+        self.profile_menu.grid(row=1, column=1, padx=12, pady=4, sticky="w")
+
+        ctk.CTkLabel(profile_frame, text="Productive apps (comma-separated)",
+                     text_color=COLORS["text_dim"]).grid(row=2, column=0, padx=12, pady=(4, 2), sticky="w")
+        self.profile_prod_entry = ctk.CTkEntry(profile_frame)
+        self.profile_prod_entry.grid(row=2, column=1, padx=12, pady=(4, 2), sticky="ew")
+
+        ctk.CTkLabel(profile_frame, text="Neutral apps (comma-separated)",
+                     text_color=COLORS["text_dim"]).grid(row=3, column=0, padx=12, pady=2, sticky="w")
+        self.profile_neut_entry = ctk.CTkEntry(profile_frame)
+        self.profile_neut_entry.grid(row=3, column=1, padx=12, pady=2, sticky="ew")
+
+        ctk.CTkLabel(profile_frame, text="Distracting apps (comma-separated)",
+                     text_color=COLORS["text_dim"]).grid(row=4, column=0, padx=12, pady=2, sticky="w")
+        self.profile_dist_entry = ctk.CTkEntry(profile_frame)
+        self.profile_dist_entry.grid(row=4, column=1, padx=12, pady=2, sticky="ew")
+
+        ctk.CTkLabel(profile_frame, text="Productive domains",
+                     text_color=COLORS["text_dim"]).grid(row=5, column=0, padx=12, pady=2, sticky="w")
+        self.profile_prod_domain_entry = ctk.CTkEntry(profile_frame)
+        self.profile_prod_domain_entry.grid(row=5, column=1, padx=12, pady=2, sticky="ew")
+
+        ctk.CTkLabel(profile_frame, text="Distracting domains",
+                     text_color=COLORS["text_dim"]).grid(row=6, column=0, padx=12, pady=2, sticky="w")
+        self.profile_dist_domain_entry = ctk.CTkEntry(profile_frame)
+        self.profile_dist_domain_entry.grid(row=6, column=1, padx=12, pady=2, sticky="ew")
+
+        ctk.CTkButton(profile_frame, text="Apply Profile Lists", width=160,
+                      command=self._apply_profile_entries).grid(
+            row=7, column=0, padx=12, pady=(6, 12), sticky="w"
+        )
+
         # Calibration
         cal_frame = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
-        cal_frame.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+        cal_frame.grid(row=4, column=0, padx=12, pady=5, sticky="ew")
         cal_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(cal_frame, text="Eye Calibration",
-                     font=ctk.CTkFont(size=14, weight="bold"),
+                     font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=COLORS["text"]).grid(row=0, column=0, columnspan=2,
-                                                      padx=12, pady=(10, 5), sticky="w")
+                                                      padx=14, pady=(12, 6), sticky="w")
 
         self.cal_status = ctk.CTkLabel(cal_frame, text="Not calibrated — using defaults",
                                         text_color=COLORS["text_dim"])
         self.cal_status.grid(row=1, column=0, padx=12, pady=4, sticky="w")
 
-        self.cal_btn = ctk.CTkButton(cal_frame, text="Calibrate Now (3s)",
+        self.cal_btn = ctk.CTkButton(cal_frame, text="Calibrate Now (Quick)",
                                       width=140, command=self._start_calibration)
         self.cal_btn.grid(row=1, column=1, padx=12, pady=(4, 12), sticky="e")
 
+        self.cal_wizard_btn = ctk.CTkButton(
+            cal_frame, text="Start Guided Wizard", width=170, command=self._start_guided_calibration
+        )
+        self.cal_wizard_btn.grid(row=2, column=1, padx=12, pady=(0, 12), sticky="e")
+
         # Permissions
         perm_frame = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
-        perm_frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+        perm_frame.grid(row=5, column=0, padx=12, pady=5, sticky="ew")
         perm_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(perm_frame, text="Permissions",
-                     font=ctk.CTkFont(size=14, weight="bold"),
+                     font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=COLORS["text"]).grid(row=0, column=0, columnspan=3,
-                                                      padx=12, pady=(10, 5), sticky="w")
+                                                      padx=14, pady=(12, 6), sticky="w")
 
         ctk.CTkLabel(perm_frame,
                      text="This app needs Camera and Accessibility access to work fully.",
@@ -538,11 +661,11 @@ class FocusDashboard:
 
         # Score weights info
         weights_frame = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=10)
-        weights_frame.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+        weights_frame.grid(row=6, column=0, padx=12, pady=5, sticky="ew")
 
         ctk.CTkLabel(weights_frame, text="Score Weights",
-                     font=ctk.CTkFont(size=14, weight="bold"),
-                     text_color=COLORS["text"]).grid(row=0, column=0, padx=12, pady=(10, 5), sticky="w")
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text"]).grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
 
         weights_text = (
             "Eye Engagement: 20%  |  Gaze Stability: 20%  |  "
@@ -561,12 +684,39 @@ class FocusDashboard:
         self.alert_manager.sound_enabled = self.sound_var.get()
         self.distraction_slider.set(cfg.get("distraction_threshold_seconds", 30))
         self.break_slider.set(cfg.get("break_interval_minutes", 25))
+        self.goal_enabled_var.set(cfg.get("goal_enabled", True))
+        self.goal_slider.set(cfg.get("goal_minutes_target", 45))
+        self.alert_manager.fatigue_break_enabled = cfg.get("fatigue_break_enabled", True)
+        self.alert_manager._nudge_cooldowns = dict(cfg.get("nudge_cooldowns_sec", {}))
+
+        active_profile = cfg.get("active_profile", "Coding")
+        profiles = cfg.get("profiles", {})
+        self.activity_monitor.set_profiles(profiles, active_profile=active_profile)
+        self.profile_menu.configure(values=list(self.activity_monitor.profiles.keys()))
+        self.profile_var.set(self.activity_monitor.active_profile)
+        self._populate_profile_entries(self.activity_monitor.active_profile)
+
+        self.focus_engine.set_goal(
+            minutes_target=int(cfg.get("goal_minutes_target", 45)),
+            enabled=bool(cfg.get("goal_enabled", True)),
+        )
+        self.eye_tracker.apply_calibration_profile(cfg.get("calibration_profile", {}))
+        if self.eye_tracker.calibrated:
+            self.cal_status.configure(text="✓ Calibration profile loaded",
+                                      text_color=COLORS["deep_focus"])
 
     def _save_current_config(self):
         """Persist current UI settings to disk."""
         self._config["sound_enabled"] = self.sound_var.get()
         self._config["distraction_threshold_seconds"] = int(self.distraction_slider.get())
         self._config["break_interval_minutes"] = int(self.break_slider.get())
+        self._config["goal_enabled"] = self.goal_enabled_var.get()
+        self._config["goal_minutes_target"] = int(self.goal_slider.get())
+        self._config["fatigue_break_enabled"] = self.alert_manager.fatigue_break_enabled
+        self._config["nudge_cooldowns_sec"] = dict(self.alert_manager._nudge_cooldowns)
+        self._config["active_profile"] = self.activity_monitor.active_profile
+        self._config["profiles"] = self._profiles_to_config_dict()
+        self._config["calibration_profile"] = dict(self.eye_tracker.calibration_profile or {})
         save_config(self._config)
 
     def _dismiss_alert(self):
@@ -578,6 +728,56 @@ class FocusDashboard:
 
     def _update_sound_setting(self):
         self.alert_manager.sound_enabled = self.sound_var.get()
+
+    def _reset_goal_progress(self):
+        self.focus_engine.reset_goal_progress()
+
+    def _profiles_to_config_dict(self) -> dict:
+        out = {}
+        for name, prof in self.activity_monitor.profiles.items():
+            out[name] = {
+                "productive_apps": sorted(prof.get("productive_apps", [])),
+                "neutral_apps": sorted(prof.get("neutral_apps", [])),
+                "distracting_apps": sorted(prof.get("distracting_apps", [])),
+                "productive_domains": sorted(prof.get("productive_domains", [])),
+                "distracting_domains": sorted(prof.get("distracting_domains", [])),
+            }
+        return out
+
+    @staticmethod
+    def _parse_csv_list(text: str) -> list[str]:
+        return [x.strip().lower() for x in text.split(",") if x.strip()]
+
+    def _populate_profile_entries(self, profile_name: str) -> None:
+        profile = self.activity_monitor.profiles.get(profile_name, {})
+        self.profile_prod_entry.delete(0, "end")
+        self.profile_prod_entry.insert(0, ", ".join(sorted(profile.get("productive_apps", []))))
+        self.profile_neut_entry.delete(0, "end")
+        self.profile_neut_entry.insert(0, ", ".join(sorted(profile.get("neutral_apps", []))))
+        self.profile_dist_entry.delete(0, "end")
+        self.profile_dist_entry.insert(0, ", ".join(sorted(profile.get("distracting_apps", []))))
+        self.profile_prod_domain_entry.delete(0, "end")
+        self.profile_prod_domain_entry.insert(0, ", ".join(sorted(profile.get("productive_domains", []))))
+        self.profile_dist_domain_entry.delete(0, "end")
+        self.profile_dist_domain_entry.insert(0, ", ".join(sorted(profile.get("distracting_domains", []))))
+
+    def _on_profile_change(self):
+        name = self.profile_var.get()
+        self.activity_monitor.set_active_profile(name)
+        self._populate_profile_entries(name)
+
+    def _apply_profile_entries(self):
+        name = self.profile_var.get()
+        profiles = self.activity_monitor.profiles
+        profiles[name] = {
+            "productive_apps": set(self._parse_csv_list(self.profile_prod_entry.get())),
+            "neutral_apps": set(self._parse_csv_list(self.profile_neut_entry.get())),
+            "distracting_apps": set(self._parse_csv_list(self.profile_dist_entry.get())),
+            "productive_domains": set(self._parse_csv_list(self.profile_prod_domain_entry.get())),
+            "distracting_domains": set(self._parse_csv_list(self.profile_dist_domain_entry.get())),
+        }
+        self.activity_monitor.set_profiles(profiles, active_profile=name)
+        self._save_current_config()
 
     def _check_permissions(self):
         """Check macOS permission status and update indicators."""
@@ -674,6 +874,40 @@ class FocusDashboard:
                 text_color=COLORS["distracted"]
             )
 
+    def _start_guided_calibration(self):
+        if self._calibrating:
+            return
+        self._calibrating = True
+        self.cal_btn.configure(state="disabled")
+        self.cal_wizard_btn.configure(state="disabled", text="Wizard Running...")
+        self.cal_status.configure(
+            text="Guided calibration started: Neutral (30s) → Reading (30s) → Away (20s)"
+        )
+        self._calibration_stage_results = {}
+
+        def run_wizard():
+            try:
+                self.eye_tracker.start_calibration_session()
+                stages = [("neutral", 30.0), ("reading", 30.0), ("distracted", 20.0)]
+                for stage, dur in stages:
+                    self._calibration_stage_results[stage] = self.eye_tracker.collect_calibration_sample(
+                        stage, duration_s=dur
+                    )
+                profile = self.eye_tracker.finalize_calibration()
+                self.eye_tracker.apply_calibration_profile(profile)
+                self._config["calibration_profile"] = profile
+                save_config(self._config)
+                baseline = self.eye_tracker.baseline_ear
+                self.root.after(0, lambda: self._calibration_done(baseline))
+            finally:
+                self._calibrating = False
+                self.root.after(0, lambda: self.cal_btn.configure(state="normal"))
+                self.root.after(0, lambda: self.cal_wizard_btn.configure(
+                    state="normal", text="Start Guided Wizard"
+                ))
+
+        threading.Thread(target=run_wizard, daemon=True).start()
+
     def _export_csv(self):
         snapshots = list(self.focus_engine.history)
         if not snapshots:
@@ -715,41 +949,128 @@ class FocusDashboard:
                          font=ctk.CTkFont(size=12),
                          text_color=COLORS["text"]).grid(row=0, column=1, padx=4, pady=6, sticky="w")
 
+    def _refresh_analytics(self):
+        for widget in self.analytics_scroll.winfo_children():
+            widget.destroy()
+
+        hourly = self.session_manager.aggregate_hourly_focus(max_sessions=40)
+        impact = self.session_manager.aggregate_app_impact(max_sessions=40, top_n=8)
+        windows = self.session_manager.detect_distraction_windows(max_sessions=40)
+
+        if not hourly and not impact.get("top_apps") and not windows:
+            ctk.CTkLabel(
+                self.analytics_scroll,
+                text="Not enough historical data yet. Keep the app running and save sessions.",
+                font=ctk.CTkFont(size=13),
+                text_color=COLORS["text_dim"],
+            ).grid(row=0, column=0, padx=10, pady=20, sticky="w")
+            return
+
+        row = 0
+        ctk.CTkLabel(self.analytics_scroll, text="Focus By Hour",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
+        row += 1
+        for item in hourly[:24]:
+            heat = "█" * max(1, min(10, int(item["avg_score"] // 10)))
+            ctk.CTkLabel(
+                self.analytics_scroll,
+                text=f"{item['hour']:02d}:00  {heat}  avg={item['avg_score']:.1f}  n={item['samples']}",
+                font=ctk.CTkFont(family="Menlo", size=11),
+                text_color=COLORS["text_dim"],
+            ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+            row += 1
+
+        row += 1
+        ctk.CTkLabel(self.analytics_scroll, text="App/Profile Impact",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
+        row += 1
+        for app in impact.get("top_apps", [])[:8]:
+            ctk.CTkLabel(
+                self.analytics_scroll,
+                text=f"{app['key'][:38]:<38}  avg={app['avg_score']:.1f}  n={app['samples']}",
+                font=ctk.CTkFont(family="Menlo", size=11),
+                text_color=COLORS["text_dim"],
+            ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+            row += 1
+
+        row += 1
+        ctk.CTkLabel(self.analytics_scroll, text="Top Distraction Windows",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
+        row += 1
+        for win in windows[:8]:
+            reasons = ", ".join(win.get("nudge_reasons", [])) or "low-score cluster"
+            ctk.CTkLabel(
+                self.analytics_scroll,
+                text=f"{win['session_id']}  {win['duration_sec']:.0f}s  avg={win['avg_score']:.1f}  ({reasons})",
+                font=ctk.CTkFont(size=11),
+                text_color=COLORS["text_dim"],
+                wraplength=900,
+                justify="left",
+            ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+            row += 1
+
+    def _build_analytics_tab(self):
+        tab = self.tab_analytics
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        ctrl = ctk.CTkFrame(tab, fg_color=COLORS["bg_card"], corner_radius=8)
+        ctrl.grid(row=0, column=0, padx=6, pady=(6, 3), sticky="ew")
+        ctk.CTkLabel(ctrl, text="Analytics",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=COLORS["text_dim"]).grid(row=0, column=0, padx=14, pady=8, sticky="w")
+        ctk.CTkButton(ctrl, text="Refresh", width=90, height=30,
+                      font=ctk.CTkFont(size=12),
+                      command=self._refresh_analytics).grid(row=0, column=1, padx=10, pady=8)
+
+        self.analytics_scroll = ctk.CTkScrollableFrame(
+            tab, fg_color=COLORS["bg_dark"], corner_radius=8
+        )
+        self.analytics_scroll.grid(row=1, column=0, padx=5, pady=(2, 5), sticky="nsew")
+        self.analytics_scroll.grid_columnconfigure(0, weight=1)
+
+        self.analytics_status = ctk.CTkLabel(
+            self.analytics_scroll,
+            text="Analytics will appear after enough session data is collected.",
+            font=ctk.CTkFont(size=13),
+            text_color=COLORS["text_dim"],
+        )
+        self.analytics_status.grid(row=0, column=0, padx=10, pady=20, sticky="w")
+
     # ---- SCORE RING ----
 
     def _draw_score_ring(self, score: float, color: str):
-        """Draw a circular progress ring with glow and trend arrow."""
+        """Draw a circular progress ring with score text."""
         c = self.score_canvas
         c.delete("all")
-        cx, cy, r = 45, 45, 38
-        width = 8
+        cx, cy, r = 28, 28, 22
+        width = 5
 
         # Track ring background
         c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                       outline=COLORS["bg_dark"], width=width + 2)
+                       outline=COLORS["bg_card_alt"], width=width + 1)
 
-        # Glow layer (slightly larger, more transparent)
+        # Main arc
         extent = -3.6 * score
         if abs(extent) > 1:
-            c.create_arc(cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2,
-                         start=90, extent=extent,
-                         outline=color, width=3, style="arc")
-            # Main arc
             c.create_arc(cx - r, cy - r, cx + r, cy + r,
                          start=90, extent=extent,
                          outline=color, width=width, style="arc")
 
-        # Trend arrow from recent history
+        # Trend arrow
         trend = self._get_trend()
         arrow = "↑" if trend > 2 else "↓" if trend < -2 else ""
         arrow_color = COLORS["deep_focus"] if trend > 2 else COLORS["distracted"] if trend < -2 else color
 
         # Score text
-        c.create_text(cx, cy - 3, text=f"{score:.0f}",
-                       fill=color, font=("Helvetica", 26, "bold"))
+        c.create_text(cx, cy, text=f"{score:.0f}",
+                       fill=color, font=("Helvetica", 16, "bold"))
         if arrow:
-            c.create_text(cx + 20, cy - 14, text=arrow,
-                           fill=arrow_color, font=("Helvetica", 12, "bold"))
+            c.create_text(cx + 14, cy - 10, text=arrow,
+                           fill=arrow_color, font=("Helvetica", 10, "bold"))
 
     def _get_trend(self) -> float:
         """Return score trend: positive = improving, negative = declining."""
@@ -882,6 +1203,7 @@ class FocusDashboard:
         self._running = True
         self._process_thread = threading.Thread(target=self._process_loop, daemon=True)
         self._process_thread.start()
+        self._refresh_analytics()
         self.root.after(self.UPDATE_INTERVAL_MS, self._update_ui)
         self.root.mainloop()
 
@@ -915,11 +1237,23 @@ class FocusDashboard:
                 self._latest_snapshot = snapshot
 
                 # Update alerts
-                self._alert_state = self.alert_manager.update(snapshot)
+                goal_progress = self.focus_engine.get_goal_progress()
+                self._alert_state = self.alert_manager.update(
+                    snapshot,
+                    eye_metrics=eye_metrics,
+                    activity_metrics=activity_metrics,
+                    goal_progress=goal_progress,
+                )
+                snapshot.nudge_reason = self._alert_state.nudge_type or ""
 
                 # Update settings sliders → alert manager
                 self.alert_manager.distraction_threshold = int(self.distraction_slider.get())
                 self.alert_manager.break_interval = int(self.break_slider.get()) * 60
+                self.focus_engine.set_goal(
+                    minutes_target=int(self.goal_slider.get()),
+                    enabled=bool(self.goal_enabled_var.get()),
+                )
+                self.activity_monitor.set_active_profile(self.profile_var.get())
 
                 # Autosave
                 if self.session_manager.should_autosave():
@@ -971,32 +1305,43 @@ class FocusDashboard:
         self.top_state_label.configure(text=snap.state, text_color=color)
 
         avg_5 = self.focus_engine.get_average_score(300)
-        self.avg_label.configure(text=f"5-min avg: {avg_5:.0f}")
+        self.avg_label.configure(text=f"avg {avg_5:.0f}")
 
         streak = alert.current_streak_minutes
         best = alert.best_streak_minutes
-        self.streak_label.configure(text=f"Streak: {streak:.0f}m (best: {best:.0f}m)")
+        self.streak_label.configure(text=f"streak {streak:.0f}m")
+
+        goal = self.focus_engine.get_goal_progress()
+        if goal["enabled"]:
+            self.goal_label.configure(
+                text=f"Goal  {goal['focused_minutes']:.0f} / {goal['target_minutes']} min"
+            )
+            self.goal_progress.set(max(0.0, min(1.0, goal["progress_pct"] / 100)))
+        else:
+            self.goal_label.configure(text="Goal: off")
+            self.goal_progress.set(0.0)
 
         elapsed = time.time() - self.session_manager.session_start
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
-        self.session_time_label.configure(text=f"Session: {mins}:{secs:02d}")
+        self.session_time_label.configure(text=f"{mins}:{secs:02d}")
 
         # Reading mode indicator in top bar
         if eye.is_reading and eye.reading_confidence > 0.3:
-            if eye.reading_confidence > 0.7:
-                self.reading_label.configure(text=f"📖 Deep Reading ({eye.reading_confidence:.0%})")
-            else:
-                self.reading_label.configure(text=f"📖 Reading ({eye.reading_confidence:.0%})")
+            self.reading_label.configure(text=f"reading {eye.reading_confidence:.0%}")
         else:
             self.reading_label.configure(text="")
 
         # Settings slider readouts
         self.distraction_val.configure(text=f"{int(self.distraction_slider.get())}s")
         self.break_val.configure(text=f"{int(self.break_slider.get())}m")
+        self.goal_val.configure(text=f"{int(self.goal_slider.get())}m")
 
         # --- Alerts ---
-        if alert.distraction_alert_active:
+        if alert.nudge_active and alert.nudge_message:
+            self.alert_label.configure(text=alert.nudge_message)
+            self.alert_frame.grid()
+        elif alert.distraction_alert_active:
             self.alert_label.configure(text=alert.distraction_alert_message)
             self.alert_frame.grid()
         else:
@@ -1063,8 +1408,10 @@ class FocusDashboard:
             getattr(act, "app_classification", "neutral"), "➖"
         )
         act_text = (
+            f"Profile: {getattr(act, 'profile_name', 'Coding')}  |  "
             f"App: {act.active_app}  {class_icon} ({getattr(act, 'app_classification', 'neutral')})\n"
             f"Window: {act.active_window_title[:55]}\n"
+            f"Domain: {getattr(act, 'active_domain', '') or '--'}\n"
             f"Keys/min: {act.keys_per_minute:.0f}  |  Mouse/min: {act.mouse_moves_per_minute:.0f}\n"
             f"Idle: {act.total_idle_seconds:.0f}s  |  Switches/min: {act.app_switches_per_minute:.0f}"
         )

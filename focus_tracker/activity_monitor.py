@@ -6,6 +6,8 @@ to help assess whether the user is focused on their work.
 
 import time
 import threading
+import re
+from urllib.parse import urlparse
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -47,6 +49,10 @@ class ActivityMetrics:
     in_productive_app: bool = True
     # 3-tier classification: "productive", "neutral", "distracting"
     app_classification: str = "productive"
+    # Parsed domain when available from window title (mostly browser tabs)
+    active_domain: str = ""
+    # Active profile used for classification
+    profile_name: str = "Coding"
 
 
 # Default set of apps considered "productive" — users can customize
@@ -76,16 +82,62 @@ DEFAULT_DISTRACTING_APPS = {
     "steam", "epic games",
 }
 
+DEFAULT_PROFILES = {
+    "Study": {
+        "productive_apps": {
+            "notion", "obsidian", "pages", "preview", "acrobat", "safari",
+            "google chrome", "arc", "firefox", "microsoft word",
+        },
+        "neutral_apps": {"finder", "calendar", "mail", "messages", "slack", "teams"},
+        "distracting_apps": {"youtube", "tiktok", "instagram", "netflix", "steam"},
+        "productive_domains": {"docs.google.com", "scholar.google.com", "wikipedia.org"},
+        "distracting_domains": {"youtube.com", "reddit.com", "x.com", "instagram.com", "tiktok.com"},
+    },
+    "Coding": {
+        "productive_apps": DEFAULT_PRODUCTIVE_APPS,
+        "neutral_apps": DEFAULT_NEUTRAL_APPS,
+        "distracting_apps": DEFAULT_DISTRACTING_APPS,
+        "productive_domains": {"github.com", "stackoverflow.com", "docs.python.org", "developer.apple.com"},
+        "distracting_domains": {"youtube.com", "reddit.com", "x.com", "instagram.com", "tiktok.com"},
+    },
+    "Writing": {
+        "productive_apps": {
+            "pages", "microsoft word", "notion", "obsidian", "bear", "craft",
+            "google chrome", "safari", "arc",
+        },
+        "neutral_apps": {"finder", "mail", "calendar", "preview"},
+        "distracting_apps": {"youtube", "tiktok", "instagram", "netflix", "steam"},
+        "productive_domains": {"docs.google.com", "grammarly.com"},
+        "distracting_domains": {"youtube.com", "reddit.com", "x.com", "instagram.com", "tiktok.com"},
+    },
+}
+
 
 class ActivityMonitor:
     """Monitors mouse, keyboard, and active window to gauge computer activity."""
 
     def __init__(self, productive_apps: set[str] | None = None,
                  distracting_apps: set[str] | None = None,
-                 neutral_apps: set[str] | None = None):
-        self.productive_apps = productive_apps or DEFAULT_PRODUCTIVE_APPS
-        self.distracting_apps = distracting_apps or DEFAULT_DISTRACTING_APPS
-        self.neutral_apps = neutral_apps or DEFAULT_NEUTRAL_APPS
+                 neutral_apps: set[str] | None = None,
+                 profiles: dict | None = None,
+                 active_profile: str = "Coding"):
+        has_manual_lists = any(v is not None for v in (productive_apps, distracting_apps, neutral_apps))
+        self.productive_domains: set[str] = set()
+        self.distracting_domains: set[str] = set()
+        if has_manual_lists and profiles is None:
+            # Backward-compatible path used by existing tests/callers.
+            self.productive_apps = set(productive_apps or DEFAULT_PRODUCTIVE_APPS)
+            self.distracting_apps = set(distracting_apps or DEFAULT_DISTRACTING_APPS)
+            self.neutral_apps = set(neutral_apps or DEFAULT_NEUTRAL_APPS)
+            self.profiles = self._normalize_profiles(DEFAULT_PROFILES)
+            self.active_profile = active_profile if active_profile in self.profiles else "Coding"
+        else:
+            self.productive_apps = set(DEFAULT_PRODUCTIVE_APPS)
+            self.distracting_apps = set(DEFAULT_DISTRACTING_APPS)
+            self.neutral_apps = set(DEFAULT_NEUTRAL_APPS)
+            self.profiles = self._normalize_profiles(profiles or DEFAULT_PROFILES)
+            self.active_profile = active_profile if active_profile in self.profiles else "Coding"
+            self._apply_active_profile()
 
         # Mouse tracking
         self._mouse_moves: deque = deque(maxlen=500)
@@ -106,6 +158,21 @@ class ActivityMonitor:
         self._running = False
 
         self.latest_metrics = ActivityMetrics()
+
+    def set_profiles(self, profiles: dict, active_profile: str | None = None) -> None:
+        """Replace profile configuration and optionally switch active profile."""
+        self.profiles = self._normalize_profiles(profiles)
+        if active_profile is not None:
+            self.active_profile = active_profile if active_profile in self.profiles else self.active_profile
+        if self.active_profile not in self.profiles:
+            self.active_profile = next(iter(self.profiles), "Coding")
+        self._apply_active_profile()
+
+    def set_active_profile(self, profile_name: str) -> None:
+        """Switch classification profile at runtime."""
+        if profile_name in self.profiles:
+            self.active_profile = profile_name
+            self._apply_active_profile()
 
     def start(self):
         """Start monitoring mouse and keyboard in background threads."""
@@ -145,6 +212,8 @@ class ActivityMonitor:
         app_name, window_title = self._get_active_window()
         metrics.active_app = app_name
         metrics.active_window_title = window_title
+        metrics.profile_name = self.active_profile
+        metrics.active_domain = self._extract_domain(window_title)
 
         # Check for app switch
         if app_name and app_name != self._last_active_app:
@@ -159,7 +228,14 @@ class ActivityMonitor:
 
         # 3-tier app classification
         app_lower = app_name.lower()
-        if any(d in app_lower for d in self.distracting_apps):
+        domain = metrics.active_domain
+        if domain and any(domain == d or domain.endswith(f".{d}") for d in self.distracting_domains):
+            metrics.in_productive_app = False
+            metrics.app_classification = "distracting"
+        elif domain and any(domain == d or domain.endswith(f".{d}") for d in self.productive_domains):
+            metrics.in_productive_app = True
+            metrics.app_classification = "productive"
+        elif any(d in app_lower for d in self.distracting_apps):
             metrics.in_productive_app = False
             metrics.app_classification = "distracting"
         elif any(n in app_lower for n in self.neutral_apps):
@@ -195,6 +271,48 @@ class ActivityMonitor:
 
         self.latest_metrics = metrics
         return metrics
+
+    def _apply_active_profile(self) -> None:
+        profile = self.profiles.get(self.active_profile, {})
+        self.productive_apps = set(profile.get("productive_apps", DEFAULT_PRODUCTIVE_APPS))
+        self.neutral_apps = set(profile.get("neutral_apps", DEFAULT_NEUTRAL_APPS))
+        self.distracting_apps = set(profile.get("distracting_apps", DEFAULT_DISTRACTING_APPS))
+        self.productive_domains = set(profile.get("productive_domains", set()))
+        self.distracting_domains = set(profile.get("distracting_domains", set()))
+
+    @staticmethod
+    def _normalize_profiles(profiles: dict) -> dict:
+        normalized = {}
+        for name, data in (profiles or {}).items():
+            normalized[name] = {
+                "productive_apps": set(str(v).lower() for v in data.get("productive_apps", [])),
+                "neutral_apps": set(str(v).lower() for v in data.get("neutral_apps", [])),
+                "distracting_apps": set(str(v).lower() for v in data.get("distracting_apps", [])),
+                "productive_domains": set(str(v).lower() for v in data.get("productive_domains", [])),
+                "distracting_domains": set(str(v).lower() for v in data.get("distracting_domains", [])),
+            }
+        if not normalized:
+            return ActivityMonitor._normalize_profiles(DEFAULT_PROFILES)
+        return normalized
+
+    @staticmethod
+    def _extract_domain(window_title: str) -> str:
+        """Best-effort domain extraction from browser-like window titles."""
+        if not window_title:
+            return ""
+        text = window_title.strip().lower()
+        if "://" in text:
+            try:
+                host = urlparse(text).netloc.lower()
+                return host[4:] if host.startswith("www.") else host
+            except Exception:
+                pass
+        # Common browser title pattern contains a domain-like token.
+        matches = re.findall(r"(?:www\.)?(?:[a-z0-9\-]+\.)+[a-z]{2,}", text)
+        if matches:
+            dom = matches[-1]
+            return dom[4:] if dom.startswith("www.") else dom
+        return ""
 
     # ---- Listener callbacks ----
 

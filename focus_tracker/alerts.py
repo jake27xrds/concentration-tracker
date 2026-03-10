@@ -6,7 +6,6 @@ Monitors focus state and triggers alerts/reminders.
 import time
 import subprocess
 import platform
-from collections import deque
 from dataclasses import dataclass
 
 from focus_tracker.focus_engine import FocusSnapshot
@@ -28,6 +27,12 @@ class AlertState:
     # Streak tracking
     current_streak_minutes: float = 0.0
     best_streak_minutes: float = 0.0
+    # Smart nudge payload
+    nudge_active: bool = False
+    nudge_type: str = ""
+    nudge_message: str = ""
+    nudge_reason: str = ""
+    nudge_last_fired_at: float = 0.0
 
 
 class AlertManager:
@@ -48,23 +53,34 @@ class AlertManager:
         break_interval_min: int = 25,
         break_duration_min: int = 5,
         sound_enabled: bool = True,
+        nudge_cooldowns_sec: dict | None = None,
+        fatigue_break_enabled: bool = True,
     ):
         self.distraction_threshold = distraction_threshold_sec
         self.break_interval = break_interval_min * 60  # convert to seconds
         self.break_duration = break_duration_min * 60
         self.sound_enabled = sound_enabled
+        self.fatigue_break_enabled = fatigue_break_enabled
 
         self.state = AlertState()
         self._last_sound_time = 0.0
         self._sound_cooldown = 30.0  # don't spam sounds
         self._break_taken_at = 0.0
         self._in_break = False
+        self._nudge_cooldowns = nudge_cooldowns_sec or {
+            "prolonged_distraction": 45,
+            "high_app_switching": 60,
+            "long_idle_drift": 60,
+            "break_due": 180,
+            "fatigue_risk": 180,
+        }
+        self._last_nudge_at: dict[str, float] = {}
 
         # Focus streak tracking
         self._streak_start: float | None = None
         self._best_streak = 0.0
 
-    def update(self, snapshot: FocusSnapshot) -> AlertState:
+    def update(self, snapshot: FocusSnapshot, eye_metrics=None, activity_metrics=None, goal_progress: dict | None = None) -> AlertState:
         """Update alert state based on the latest focus snapshot."""
         now = snapshot.timestamp
         state = snapshot.state
@@ -89,6 +105,12 @@ class AlertManager:
                         f"⚠️ Distracted for {seconds}s — get back on track!"
                     )
                 self._play_alert_sound()
+                self._maybe_fire_nudge(
+                    now,
+                    "prolonged_distraction",
+                    self.state.distraction_alert_message,
+                    "Sustained distracted state exceeded threshold",
+                )
             else:
                 self.state.distraction_alert_active = False
                 self.state.distraction_alert_message = ""
@@ -113,6 +135,12 @@ class AlertManager:
                     f"Consider a {self.break_duration // 60}-minute break."
                 )
                 self._play_break_sound()
+                self._maybe_fire_nudge(
+                    now,
+                    "break_due",
+                    self.state.break_reminder_message,
+                    "Sustained focus reached break interval",
+                )
             else:
                 self.state.break_reminder_active = False
                 self.state.break_reminder_message = ""
@@ -155,6 +183,14 @@ class AlertManager:
             self.state.best_streak_minutes, self.state.current_streak_minutes
         )
 
+        self._evaluate_contextual_nudges(
+            now=now,
+            snapshot=snapshot,
+            eye_metrics=eye_metrics,
+            activity_metrics=activity_metrics,
+            goal_progress=goal_progress or {},
+        )
+
         return self.state
 
     def acknowledge_break(self):
@@ -163,6 +199,10 @@ class AlertManager:
         self.state.focused_since = 0
         self.state.break_reminder_active = False
         self.state.break_reminder_message = ""
+        self.state.nudge_active = False
+        self.state.nudge_message = ""
+        self.state.nudge_reason = ""
+        self.state.nudge_type = ""
 
     def _play_alert_sound(self):
         """Play a gentle alert sound on macOS."""
@@ -192,3 +232,81 @@ class AlertManager:
                 ["afplay", "/System/Library/Sounds/Glass.aiff"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+
+    def _maybe_fire_nudge(self, now: float, nudge_type: str, message: str, reason: str) -> bool:
+        cooldown = float(self._nudge_cooldowns.get(nudge_type, 60))
+        last = self._last_nudge_at.get(nudge_type, 0.0)
+        if now - last < cooldown:
+            return False
+        self._last_nudge_at[nudge_type] = now
+        self.state.nudge_active = True
+        self.state.nudge_type = nudge_type
+        self.state.nudge_message = message
+        self.state.nudge_reason = reason
+        self.state.nudge_last_fired_at = now
+        return True
+
+    def _evaluate_contextual_nudges(
+        self,
+        now: float,
+        snapshot: FocusSnapshot,
+        eye_metrics=None,
+        activity_metrics=None,
+        goal_progress: dict | None = None,
+    ) -> None:
+        # Reset transient nudge if stale.
+        if self.state.nudge_active and (now - self.state.nudge_last_fired_at > 20):
+            self.state.nudge_active = False
+            self.state.nudge_type = ""
+            self.state.nudge_message = ""
+            self.state.nudge_reason = ""
+
+        if activity_metrics is not None:
+            if getattr(activity_metrics, "app_switches_per_minute", 0) >= 10:
+                self._maybe_fire_nudge(
+                    now,
+                    "high_app_switching",
+                    "🔁 Rapid app switching detected. Try committing to one task for 10 minutes.",
+                    "High app switching indicates context fragmentation",
+                )
+            elif getattr(activity_metrics, "total_idle_seconds", 0) >= 120 and snapshot.state != "Away":
+                self._maybe_fire_nudge(
+                    now,
+                    "long_idle_drift",
+                    "⏳ Idle drift detected. Reset with a tiny next action and resume.",
+                    "Long idle interval without Away state",
+                )
+
+        fatigue_risk = False
+        if eye_metrics is not None and self.fatigue_break_enabled:
+            if getattr(eye_metrics, "eyes_closed_duration", 0.0) >= 1.2:
+                fatigue_risk = True
+            if getattr(eye_metrics, "blinks_per_minute", 0.0) >= 32:
+                fatigue_risk = True
+
+        if fatigue_risk:
+            self._maybe_fire_nudge(
+                now,
+                "fatigue_risk",
+                "😴 Fatigue signs detected. A 3–5 minute break can preserve focus quality.",
+                "Eye fatigue indicators exceeded threshold",
+            )
+            # Adaptive break coach: fatigue can activate reminder earlier.
+            if not self.state.break_reminder_active:
+                streak_min = self.state.current_streak_minutes
+                if streak_min >= 15:
+                    self.state.break_reminder_active = True
+                    self.state.break_reminder_message = (
+                        "🧘 You are showing fatigue signals after a long streak. "
+                        "Consider a short recovery break."
+                    )
+
+        # Goal-aware encouragement / warning.
+        if goal_progress and goal_progress.get("enabled", False):
+            if not goal_progress.get("on_track", True) and snapshot.state == "Distracted":
+                self._maybe_fire_nudge(
+                    now,
+                    "prolonged_distraction",
+                    "🎯 Goal pace is slipping. Try one 5-minute focused sprint now.",
+                    "Goal pace is behind while distracted",
+                )

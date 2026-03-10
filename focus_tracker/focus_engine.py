@@ -30,6 +30,14 @@ class FocusSnapshot:
     app_focus_score: float = 50.0
     # Derived state
     state: str = "Neutral"  # "Deep Focus", "Focused", "Neutral", "Distracted", "Away"
+    # Metadata for analytics/coaching
+    active_app: str = ""
+    app_classification: str = "neutral"
+    profile_name: str = "Coding"
+    active_domain: str = ""
+    is_reading: bool = False
+    goal_progress_pct: float = 0.0
+    nudge_reason: str = ""
 
 
 class FocusEngine:
@@ -59,11 +67,15 @@ class FocusEngine:
         "app_focus": 0.25,
     }
 
-    def __init__(self, history_minutes: int = 60):
+    def __init__(self, history_minutes: int = 60, goal_minutes_target: int = 45, goal_enabled: bool = True):
         max_entries = history_minutes * 60  # ~1 per second
         self.history: deque[FocusSnapshot] = deque(maxlen=max_entries)
         self._gaze_history: deque = deque(maxlen=30)  # for stability calc
         self._gaze_variance_history: deque = deque(maxlen=20)  # sustained variance tracking
+        self.goal_minutes_target = max(1, int(goal_minutes_target))
+        self.goal_enabled = bool(goal_enabled)
+        self._focused_seconds = 0.0
+        self._last_timestamp: float | None = None
 
         # Hysteresis: prevent state jitter on score boundaries
         self._current_state = "Neutral"
@@ -74,6 +86,11 @@ class FocusEngine:
     def calculate(self, eye: EyeMetrics, activity: ActivityMetrics) -> FocusSnapshot:
         """Compute focus score from the latest eye and activity metrics."""
         snap = FocusSnapshot(timestamp=time.time())
+        snap.active_app = getattr(activity, "active_app", "")
+        snap.app_classification = getattr(activity, "app_classification", "neutral")
+        snap.profile_name = getattr(activity, "profile_name", "Coding")
+        snap.active_domain = getattr(activity, "active_domain", "")
+        snap.is_reading = bool(eye.is_reading)
 
         # --- Eye Engagement (face + combined attention + sustained eye closure) ---
         if not eye.face_detected:
@@ -200,6 +217,7 @@ class FocusEngine:
             raw_state = "Distracted"
 
         snap.state = self._apply_hysteresis(raw_state, snap.focus_score)
+        self._update_goal_progress(snap)
 
         self.history.append(snap)
         return snap
@@ -284,6 +302,55 @@ class FocusEngine:
             "time_away_pct": states.count("Away") / total * 100,
             "total_readings": total,
         }
+
+    def set_goal(self, minutes_target: int, enabled: bool = True) -> None:
+        self.goal_minutes_target = max(1, int(minutes_target))
+        self.goal_enabled = bool(enabled)
+
+    def reset_goal_progress(self) -> None:
+        self._focused_seconds = 0.0
+        self._last_timestamp = None
+        for snap in self.history:
+            snap.goal_progress_pct = 0.0
+
+    def get_goal_progress(self) -> dict:
+        target_seconds = self.goal_minutes_target * 60
+        focused_minutes = self._focused_seconds / 60
+        pct = min(100.0, (self._focused_seconds / target_seconds) * 100) if target_seconds > 0 else 0.0
+
+        session_seconds = 0.0
+        if self.history:
+            session_seconds = max(1.0, self.history[-1].timestamp - self.history[0].timestamp)
+        pace = (self._focused_seconds / session_seconds) if session_seconds > 0 else 0.0
+        on_track = pace >= 0.6 if self.goal_enabled else True
+        eta_minutes = max(0.0, (target_seconds - self._focused_seconds) / 60) if pace > 0 else float("inf")
+
+        return {
+            "enabled": self.goal_enabled,
+            "target_minutes": self.goal_minutes_target,
+            "focused_minutes": focused_minutes,
+            "progress_pct": pct,
+            "on_track": on_track,
+            "eta_minutes": eta_minutes,
+        }
+
+    def _update_goal_progress(self, snap: FocusSnapshot) -> None:
+        now = snap.timestamp
+        if self._last_timestamp is None:
+            self._last_timestamp = now
+            snap.goal_progress_pct = 0.0
+            return
+
+        dt = max(0.0, min(2.0, now - self._last_timestamp))
+        self._last_timestamp = now
+        if snap.state in ("Focused", "Deep Focus"):
+            self._focused_seconds += dt
+
+        target_seconds = self.goal_minutes_target * 60
+        if self.goal_enabled and target_seconds > 0:
+            snap.goal_progress_pct = min(100.0, (self._focused_seconds / target_seconds) * 100)
+        else:
+            snap.goal_progress_pct = 0.0
 
 
 def _remap(value: float, in_min: float, in_max: float,
