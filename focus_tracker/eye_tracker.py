@@ -9,6 +9,7 @@ import math
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Optional
 
 import cv2
 import mediapipe as mp
@@ -321,7 +322,7 @@ class EyeTracker:
     def __init__(self, camera_index: int = 0):
         self.camera_index = camera_index
         self.cap = None
-        self.landmarker: FaceLandmarker | None = None
+        self.landmarker: Optional[FaceLandmarker] = None # type: ignore
 
         # Blink tracking — uses raw (unsmoothed) EAR
         self._blink_counter = 0
