@@ -7,6 +7,7 @@ import signal
 import logging
 import argparse
 
+from focus_tracker import configure_logging
 from focus_tracker.eye_tracker import EyeTracker
 from focus_tracker.activity_monitor import ActivityMonitor
 from focus_tracker.focus_engine import FocusEngine
@@ -30,25 +31,44 @@ def parse_args() -> argparse.Namespace:
         default=60,
         help="Focus history window size in minutes (default: 60).",
     )
+    parser.add_argument(
+        "--intent",
+        type=str,
+        default="coding",
+        choices=["coding", "reading", "studying", "writing", "general"],
+        help="Session intent profile to tune scoring (default: coding).",
+    )
+    parser.add_argument(
+        "--no-baseline",
+        action="store_true",
+        help="Disable personal baseline adaptation for this run.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    configure_logging()
     args = parse_args()
     history_minutes = max(1, args.history_minutes)
     if history_minutes != args.history_minutes:
         log.warning("history_minutes must be >= 1; using %d", history_minutes)
 
     log.info(
-        "Focus Tracker — Starting up (camera_index=%d, history_minutes=%d)",
+        "Focus Tracker — Starting up (camera_index=%d, history_minutes=%d, intent=%s, baseline=%s)",
         args.camera_index,
         history_minutes,
+        args.intent,
+        "on" if not args.no_baseline else "off",
     )
 
     # --- Initialize components ---
     eye_tracker = EyeTracker(camera_index=args.camera_index)
     activity_monitor = ActivityMonitor()
-    focus_engine = FocusEngine(history_minutes=history_minutes)
+    focus_engine = FocusEngine(
+        history_minutes=history_minutes,
+        intent_name=args.intent,
+        baseline_enabled=not args.no_baseline,
+    )
 
     # --- Start eye tracker ---
     camera_available = False

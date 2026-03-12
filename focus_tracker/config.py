@@ -32,6 +32,10 @@ DEFAULTS = {
     },
     "goal_enabled": True,
     "goal_minutes_target": 45,
+    "weekly_sessions_target": 5,
+    "active_intent": "coding",
+    "baseline_enabled": True,
+    "overlay_enabled": False,
     "fatigue_break_enabled": True,
     "nudge_cooldowns_sec": {
         "prolonged_distraction": 45,

@@ -59,6 +59,8 @@ class SessionManager:
                     "profile_name": s.profile_name,
                     "active_domain": s.active_domain,
                     "is_reading": s.is_reading,
+                    "intent_name": s.intent_name,
+                    "baseline_adjustment": round(s.baseline_adjustment, 2),
                     "goal_progress_pct": round(s.goal_progress_pct, 1),
                     "nudge_reason": s.nudge_reason,
                 }
@@ -83,7 +85,8 @@ class SessionManager:
                 "eye_engagement", "gaze_stability", "blink",
                 "activity", "app_focus"
                 , "active_app", "app_classification", "profile_name", "active_domain",
-                "is_reading", "goal_progress_pct", "nudge_reason"
+                "is_reading", "intent_name", "baseline_adjustment",
+                "goal_progress_pct", "nudge_reason"
             ])
             for s in snapshots:
                 writer.writerow([
@@ -101,6 +104,8 @@ class SessionManager:
                     s.profile_name,
                     s.active_domain,
                     int(bool(s.is_reading)),
+                    s.intent_name,
+                    round(s.baseline_adjustment, 2),
                     round(s.goal_progress_pct, 1),
                     s.nudge_reason,
                 ])
@@ -162,6 +167,7 @@ class SessionManager:
         by_app: dict[str, list[float]] = defaultdict(list)
         by_class: dict[str, list[float]] = defaultdict(list)
         by_profile: dict[str, list[float]] = defaultdict(list)
+        by_intent: dict[str, list[float]] = defaultdict(list)
 
         for sess in self.load_recent_sessions(max_sessions=max_sessions):
             for snap in sess.get("snapshots", []):
@@ -172,9 +178,11 @@ class SessionManager:
                 app = (snap.get("active_app") or "Unknown").strip()
                 cls = (snap.get("app_classification") or "neutral").strip()
                 profile = (snap.get("profile_name") or "Coding").strip()
+                intent = (snap.get("intent_name") or "general").strip()
                 by_app[app].append(score)
                 by_class[cls].append(score)
                 by_profile[profile].append(score)
+                by_intent[intent].append(score)
 
         def summarize_map(source: dict[str, list[float]], limit: int | None = None) -> list[dict]:
             rows = []
@@ -193,6 +201,47 @@ class SessionManager:
             "top_apps": summarize_map(by_app, limit=top_n),
             "by_classification": summarize_map(by_class),
             "by_profile": summarize_map(by_profile),
+            "by_intent": summarize_map(by_intent),
+        }
+
+    def aggregate_goal_achievements(self, max_sessions: int = 30) -> dict:
+        """
+        Aggregate milestone and consistency performance across recent sessions.
+        """
+        sessions = self.load_recent_sessions(max_sessions=max_sessions)
+        if not sessions:
+            return {
+                "sessions": 0,
+                "avg_goal_completion_pct": 0.0,
+                "avg_consistency_score": 0.0,
+                "full_goal_hit_pct": 0.0,
+                "milestone_hits": {"25": 0, "50": 0, "75": 0, "100": 0},
+            }
+
+        completions: list[float] = []
+        consistencies: list[float] = []
+        full_hits = 0
+        milestones = {"25": 0, "50": 0, "75": 0, "100": 0}
+
+        for sess in sessions:
+            summary = sess.get("summary", {}) or {}
+            completion = float(summary.get("goal_completion_pct", 0.0) or 0.0)
+            consistency = float(summary.get("consistency_score", 0.0) or 0.0)
+            completions.append(completion)
+            consistencies.append(consistency)
+            if completion >= 100:
+                full_hits += 1
+            for mark in (25, 50, 75, 100):
+                if completion >= mark:
+                    milestones[str(mark)] += 1
+
+        total = len(sessions)
+        return {
+            "sessions": total,
+            "avg_goal_completion_pct": round(sum(completions) / len(completions), 2),
+            "avg_consistency_score": round(sum(consistencies) / len(consistencies), 2),
+            "full_goal_hit_pct": round((full_hits / total) * 100, 2) if total else 0.0,
+            "milestone_hits": milestones,
         }
 
     def detect_distraction_windows(

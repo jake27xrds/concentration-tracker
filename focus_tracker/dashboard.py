@@ -83,6 +83,17 @@ class FocusDashboard:
         self._running = False
         self._calibrating = False
         self._calibration_stage_results: dict[str, dict] = {}
+        self._rt_distraction_threshold = 30
+        self._rt_break_interval_seconds = 25 * 60
+        self._rt_goal_enabled = True
+        self._rt_goal_minutes_target = 45
+        self._rt_active_profile = "Coding"
+        self._rt_intent = "coding"
+        self._rt_baseline_enabled = True
+        self._rt_overlay_enabled = False
+        self._overlay_window: ctk.CTkToplevel | None = None
+        self._overlay_score_label: ctk.CTkLabel | None = None
+        self._overlay_meta_label: ctk.CTkLabel | None = None
 
         # Graph data buffer
         self._graph_scores: deque = deque(maxlen=600)  # 10 min at 1/sec
@@ -466,7 +477,8 @@ class FocusDashboard:
         ctk.CTkLabel(alert_frame, text="Distraction alert after (seconds)",
                      text_color=COLORS["text_dim"]).grid(row=2, column=0, padx=12, pady=4, sticky="w")
         self.distraction_slider = ctk.CTkSlider(alert_frame, from_=10, to=120,
-                                                 number_of_steps=11)
+                                                 number_of_steps=11,
+                                                 command=self._on_distraction_threshold_change)
         self.distraction_slider.set(30)
         self.distraction_slider.grid(row=2, column=1, padx=12, pady=4, sticky="ew")
         self.distraction_val = ctk.CTkLabel(alert_frame, text="30s",
@@ -477,7 +489,8 @@ class FocusDashboard:
         ctk.CTkLabel(alert_frame, text="Break reminder every (minutes)",
                      text_color=COLORS["text_dim"]).grid(row=3, column=0, padx=12, pady=4, sticky="w")
         self.break_slider = ctk.CTkSlider(alert_frame, from_=10, to=60,
-                                           number_of_steps=10)
+                                           number_of_steps=10,
+                                           command=self._on_break_interval_change)
         self.break_slider.set(25)
         self.break_slider.grid(row=3, column=1, padx=12, pady=4, sticky="ew")
         self.break_val = ctk.CTkLabel(alert_frame, text="25m",
@@ -497,13 +510,24 @@ class FocusDashboard:
         self.goal_enabled_var = ctk.BooleanVar(value=True)
         ctk.CTkLabel(goal_frame, text="Enable goal",
                      text_color=COLORS["text_dim"]).grid(row=1, column=0, padx=12, pady=4, sticky="w")
-        ctk.CTkSwitch(goal_frame, text="", variable=self.goal_enabled_var).grid(
+        ctk.CTkSwitch(
+            goal_frame,
+            text="",
+            variable=self.goal_enabled_var,
+            command=self._on_goal_enabled_change,
+        ).grid(
             row=1, column=1, padx=12, pady=4, sticky="w"
         )
 
         ctk.CTkLabel(goal_frame, text="Focused minutes target",
                      text_color=COLORS["text_dim"]).grid(row=2, column=0, padx=12, pady=4, sticky="w")
-        self.goal_slider = ctk.CTkSlider(goal_frame, from_=15, to=180, number_of_steps=33)
+        self.goal_slider = ctk.CTkSlider(
+            goal_frame,
+            from_=15,
+            to=180,
+            number_of_steps=33,
+            command=self._on_goal_target_change,
+        )
         self.goal_slider.set(45)
         self.goal_slider.grid(row=2, column=1, padx=12, pady=4, sticky="ew")
         self.goal_val = ctk.CTkLabel(goal_frame, text="45m",
@@ -513,6 +537,34 @@ class FocusDashboard:
         ctk.CTkButton(goal_frame, text="Reset Goal Progress", width=150,
                        command=self._reset_goal_progress).grid(
             row=3, column=0, padx=12, pady=(4, 12), sticky="w"
+        )
+
+        ctk.CTkLabel(goal_frame, text="Session intent",
+                     text_color=COLORS["text_dim"]).grid(row=4, column=0, padx=12, pady=4, sticky="w")
+        self.intent_var = ctk.StringVar(value="coding")
+        self.intent_menu = ctk.CTkOptionMenu(
+            goal_frame,
+            values=["coding", "reading", "studying", "writing", "general"],
+            variable=self.intent_var,
+            command=self._on_intent_change,
+            width=180,
+        )
+        self.intent_menu.grid(row=4, column=1, padx=12, pady=4, sticky="w")
+
+        ctk.CTkLabel(goal_frame, text="Personal baseline adaptation",
+                     text_color=COLORS["text_dim"]).grid(row=5, column=0, padx=12, pady=4, sticky="w")
+        self.baseline_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(goal_frame, text="", variable=self.baseline_var,
+                      command=self._on_baseline_toggle).grid(
+            row=5, column=1, padx=12, pady=4, sticky="w"
+        )
+
+        ctk.CTkLabel(goal_frame, text="Mini overlay HUD",
+                     text_color=COLORS["text_dim"]).grid(row=6, column=0, padx=12, pady=(4, 12), sticky="w")
+        self.overlay_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(goal_frame, text="", variable=self.overlay_var,
+                      command=self._on_overlay_toggle).grid(
+            row=6, column=1, padx=12, pady=(4, 12), sticky="w"
         )
 
         # Profile settings
@@ -532,7 +584,7 @@ class FocusDashboard:
             profile_frame,
             values=["Study", "Coding", "Writing"],
             variable=self.profile_var,
-            command=lambda _: self._on_profile_change(),
+            command=self._on_profile_change,
         )
         self.profile_menu.grid(row=1, column=1, padx=12, pady=4, sticky="w")
 
@@ -686,6 +738,9 @@ class FocusDashboard:
         self.break_slider.set(cfg.get("break_interval_minutes", 25))
         self.goal_enabled_var.set(cfg.get("goal_enabled", True))
         self.goal_slider.set(cfg.get("goal_minutes_target", 45))
+        self.intent_var.set(str(cfg.get("active_intent", "coding")))
+        self.baseline_var.set(bool(cfg.get("baseline_enabled", True)))
+        self.overlay_var.set(bool(cfg.get("overlay_enabled", False)))
         self.alert_manager.fatigue_break_enabled = cfg.get("fatigue_break_enabled", True)
         self.alert_manager._nudge_cooldowns = dict(cfg.get("nudge_cooldowns_sec", {}))
 
@@ -695,11 +750,7 @@ class FocusDashboard:
         self.profile_menu.configure(values=list(self.activity_monitor.profiles.keys()))
         self.profile_var.set(self.activity_monitor.active_profile)
         self._populate_profile_entries(self.activity_monitor.active_profile)
-
-        self.focus_engine.set_goal(
-            minutes_target=int(cfg.get("goal_minutes_target", 45)),
-            enabled=bool(cfg.get("goal_enabled", True)),
-        )
+        self._sync_runtime_settings_from_ui()
         self.eye_tracker.apply_calibration_profile(cfg.get("calibration_profile", {}))
         if self.eye_tracker.calibrated:
             self.cal_status.configure(text="✓ Calibration profile loaded",
@@ -712,6 +763,9 @@ class FocusDashboard:
         self._config["break_interval_minutes"] = int(self.break_slider.get())
         self._config["goal_enabled"] = self.goal_enabled_var.get()
         self._config["goal_minutes_target"] = int(self.goal_slider.get())
+        self._config["active_intent"] = self.intent_var.get()
+        self._config["baseline_enabled"] = self.baseline_var.get()
+        self._config["overlay_enabled"] = self.overlay_var.get()
         self._config["fatigue_break_enabled"] = self.alert_manager.fatigue_break_enabled
         self._config["nudge_cooldowns_sec"] = dict(self.alert_manager._nudge_cooldowns)
         self._config["active_profile"] = self.activity_monitor.active_profile
@@ -731,6 +785,104 @@ class FocusDashboard:
 
     def _reset_goal_progress(self):
         self.focus_engine.reset_goal_progress()
+
+    def _set_overlay_enabled(self, enabled: bool) -> None:
+        if enabled:
+            if self._overlay_window is None or not self._overlay_window.winfo_exists():
+                self._create_overlay_window()
+        else:
+            if self._overlay_window is not None:
+                try:
+                    self._overlay_window.destroy()
+                except Exception:
+                    pass
+                self._overlay_window = None
+                self._overlay_score_label = None
+                self._overlay_meta_label = None
+
+    def _create_overlay_window(self) -> None:
+        overlay = ctk.CTkToplevel(self.root)
+        overlay.title("Focus HUD")
+        overlay.geometry("240x120+40+40")
+        overlay.resizable(False, False)
+        overlay.attributes("-topmost", True)
+        overlay.configure(fg_color=COLORS["bg_card"])
+        overlay.protocol("WM_DELETE_WINDOW", self._overlay_closed_by_user)
+
+        self._overlay_score_label = ctk.CTkLabel(
+            overlay,
+            text="50",
+            font=ctk.CTkFont(size=34, weight="bold"),
+            text_color=COLORS["neutral"],
+        )
+        self._overlay_score_label.pack(pady=(12, 2))
+
+        self._overlay_meta_label = ctk.CTkLabel(
+            overlay,
+            text="Neutral",
+            font=ctk.CTkFont(size=12),
+            text_color=COLORS["text_dim"],
+        )
+        self._overlay_meta_label.pack(pady=(0, 8))
+        self._overlay_window = overlay
+
+    def _overlay_closed_by_user(self) -> None:
+        self.overlay_var.set(False)
+        self._rt_overlay_enabled = False
+        self._set_overlay_enabled(False)
+
+    def _apply_runtime_settings(self) -> None:
+        self.alert_manager.distraction_threshold = self._rt_distraction_threshold
+        self.alert_manager.break_interval = self._rt_break_interval_seconds
+        self.focus_engine.set_goal(
+            minutes_target=self._rt_goal_minutes_target,
+            enabled=self._rt_goal_enabled,
+        )
+        self.focus_engine.set_weekly_sessions_target(int(self._config.get("weekly_sessions_target", 5)))
+        self.focus_engine.set_intent(self._rt_intent)
+        self.focus_engine.set_baseline_enabled(self._rt_baseline_enabled)
+        if self._rt_active_profile != self.activity_monitor.active_profile:
+            self.activity_monitor.set_active_profile(self._rt_active_profile)
+        self._set_overlay_enabled(self._rt_overlay_enabled)
+
+    def _sync_runtime_settings_from_ui(self) -> None:
+        self._rt_distraction_threshold = int(self.distraction_slider.get())
+        self._rt_break_interval_seconds = int(self.break_slider.get()) * 60
+        self._rt_goal_enabled = bool(self.goal_enabled_var.get())
+        self._rt_goal_minutes_target = int(self.goal_slider.get())
+        self._rt_active_profile = self.profile_var.get()
+        self._rt_intent = self.intent_var.get()
+        self._rt_baseline_enabled = bool(self.baseline_var.get())
+        self._rt_overlay_enabled = bool(self.overlay_var.get())
+        self._apply_runtime_settings()
+
+    def _on_distraction_threshold_change(self, _value: float | None = None) -> None:
+        self._rt_distraction_threshold = int(self.distraction_slider.get())
+        self._apply_runtime_settings()
+
+    def _on_break_interval_change(self, _value: float | None = None) -> None:
+        self._rt_break_interval_seconds = int(self.break_slider.get()) * 60
+        self._apply_runtime_settings()
+
+    def _on_goal_enabled_change(self) -> None:
+        self._rt_goal_enabled = bool(self.goal_enabled_var.get())
+        self._apply_runtime_settings()
+
+    def _on_goal_target_change(self, _value: float | None = None) -> None:
+        self._rt_goal_minutes_target = int(self.goal_slider.get())
+        self._apply_runtime_settings()
+
+    def _on_intent_change(self, _value: str | None = None) -> None:
+        self._rt_intent = self.intent_var.get()
+        self._apply_runtime_settings()
+
+    def _on_baseline_toggle(self) -> None:
+        self._rt_baseline_enabled = bool(self.baseline_var.get())
+        self._apply_runtime_settings()
+
+    def _on_overlay_toggle(self) -> None:
+        self._rt_overlay_enabled = bool(self.overlay_var.get())
+        self._apply_runtime_settings()
 
     def _profiles_to_config_dict(self) -> dict:
         out = {}
@@ -761,9 +913,10 @@ class FocusDashboard:
         self.profile_dist_domain_entry.delete(0, "end")
         self.profile_dist_domain_entry.insert(0, ", ".join(sorted(profile.get("distracting_domains", []))))
 
-    def _on_profile_change(self):
+    def _on_profile_change(self, _value: str | None = None):
         name = self.profile_var.get()
-        self.activity_monitor.set_active_profile(name)
+        self._rt_active_profile = name
+        self._apply_runtime_settings()
         self._populate_profile_entries(name)
 
     def _apply_profile_entries(self):
@@ -777,6 +930,8 @@ class FocusDashboard:
             "distracting_domains": set(self._parse_csv_list(self.profile_dist_domain_entry.get())),
         }
         self.activity_monitor.set_profiles(profiles, active_profile=name)
+        self._rt_active_profile = self.activity_monitor.active_profile
+        self._apply_runtime_settings()
         self._save_current_config()
 
     def _check_permissions(self):
@@ -956,6 +1111,7 @@ class FocusDashboard:
         hourly = self.session_manager.aggregate_hourly_focus(max_sessions=40)
         impact = self.session_manager.aggregate_app_impact(max_sessions=40, top_n=8)
         windows = self.session_manager.detect_distraction_windows(max_sessions=40)
+        goals = self.session_manager.aggregate_goal_achievements(max_sessions=40)
 
         if not hourly and not impact.get("top_apps") and not windows:
             ctk.CTkLabel(
@@ -995,6 +1151,22 @@ class FocusDashboard:
             ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
             row += 1
 
+        intent_rows = impact.get("by_intent", [])[:5]
+        if intent_rows:
+            row += 1
+            ctk.CTkLabel(self.analytics_scroll, text="Intent Impact",
+                         font=ctk.CTkFont(size=14, weight="bold"),
+                         text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
+            row += 1
+            for intent in intent_rows:
+                ctk.CTkLabel(
+                    self.analytics_scroll,
+                    text=f"{intent['key']:<12}  avg={intent['avg_score']:.1f}  n={intent['samples']}",
+                    font=ctk.CTkFont(family="Menlo", size=11),
+                    text_color=COLORS["text_dim"],
+                ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+                row += 1
+
         row += 1
         ctk.CTkLabel(self.analytics_scroll, text="Top Distraction Windows",
                      font=ctk.CTkFont(size=14, weight="bold"),
@@ -1011,6 +1183,36 @@ class FocusDashboard:
                 justify="left",
             ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
             row += 1
+
+        row += 1
+        ctk.CTkLabel(self.analytics_scroll, text="Goal Achievement",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
+        row += 1
+        milestone_hits = goals.get("milestone_hits", {})
+        ctk.CTkLabel(
+            self.analytics_scroll,
+            text=(
+                f"sessions={goals.get('sessions', 0)}  "
+                f"avg goal={goals.get('avg_goal_completion_pct', 0):.1f}%  "
+                f"consistency={goals.get('avg_consistency_score', 0):.1f}%  "
+                f"goal-hit={goals.get('full_goal_hit_pct', 0):.1f}%"
+            ),
+            font=ctk.CTkFont(family="Menlo", size=11),
+            text_color=COLORS["text_dim"],
+        ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+        row += 1
+        ctk.CTkLabel(
+            self.analytics_scroll,
+            text=(
+                f"milestones 25%={milestone_hits.get('25', 0)}  "
+                f"50%={milestone_hits.get('50', 0)}  "
+                f"75%={milestone_hits.get('75', 0)}  "
+                f"100%={milestone_hits.get('100', 0)}"
+            ),
+            font=ctk.CTkFont(family="Menlo", size=11),
+            text_color=COLORS["text_dim"],
+        ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
 
     def _build_analytics_tab(self):
         tab = self.tab_analytics
@@ -1210,6 +1412,7 @@ class FocusDashboard:
     def _on_close(self):
         """Save session and settings, then close."""
         self._running = False
+        self._set_overlay_enabled(False)
         # Save settings
         self._save_current_config()
         # Final save
@@ -1246,14 +1449,7 @@ class FocusDashboard:
                 )
                 snapshot.nudge_reason = self._alert_state.nudge_type or ""
 
-                # Update settings sliders → alert manager
-                self.alert_manager.distraction_threshold = int(self.distraction_slider.get())
-                self.alert_manager.break_interval = int(self.break_slider.get()) * 60
-                self.focus_engine.set_goal(
-                    minutes_target=int(self.goal_slider.get()),
-                    enabled=bool(self.goal_enabled_var.get()),
-                )
-                self.activity_monitor.set_active_profile(self.profile_var.get())
+                self._apply_runtime_settings()
 
                 # Autosave
                 if self.session_manager.should_autosave():
@@ -1313,8 +1509,11 @@ class FocusDashboard:
 
         goal = self.focus_engine.get_goal_progress()
         if goal["enabled"]:
+            milestone_suffix = ""
+            if goal.get("next_milestone") is not None:
+                milestone_suffix = f"  · next {int(goal['next_milestone'])}%"
             self.goal_label.configure(
-                text=f"Goal  {goal['focused_minutes']:.0f} / {goal['target_minutes']} min"
+                text=f"Goal  {goal['focused_minutes']:.0f} / {goal['target_minutes']} min{milestone_suffix}"
             )
             self.goal_progress.set(max(0.0, min(1.0, goal["progress_pct"] / 100)))
         else:
@@ -1333,9 +1532,9 @@ class FocusDashboard:
             self.reading_label.configure(text="")
 
         # Settings slider readouts
-        self.distraction_val.configure(text=f"{int(self.distraction_slider.get())}s")
-        self.break_val.configure(text=f"{int(self.break_slider.get())}m")
-        self.goal_val.configure(text=f"{int(self.goal_slider.get())}m")
+        self.distraction_val.configure(text=f"{self._rt_distraction_threshold}s")
+        self.break_val.configure(text=f"{self._rt_break_interval_seconds // 60}m")
+        self.goal_val.configure(text=f"{self._rt_goal_minutes_target}m")
 
         # --- Alerts ---
         if alert.nudge_active and alert.nudge_message:
@@ -1420,17 +1619,33 @@ class FocusDashboard:
         # --- Session ---
         summary = self.focus_engine.get_session_summary()
         if summary["total_readings"] > 10:
+            baseline = self.focus_engine.get_baseline_stats()
             self.summary_label.configure(
                 text=(
                     f"Avg: {summary['avg_score']:.0f}  |  "
                     f"Focused: {summary['time_focused_pct']:.0f}%  |  "
                     f"Distracted: {summary['time_distracted_pct']:.0f}%  |  "
-                    f"Away: {summary.get('time_away_pct', 0):.0f}%"
+                    f"Away: {summary.get('time_away_pct', 0):.0f}%  |  "
+                    f"Intent: {summary.get('intent', 'general')}  |  "
+                    f"Baseline n={baseline.get('samples', 0)}"
                 )
             )
+
+        if self._overlay_window is not None and self._overlay_window.winfo_exists():
+            self._update_overlay(snap, goal)
 
         # --- Graph (throttled to 1/sec) ---
         now = time.time()
         if now - self._last_graph_draw >= 1.0:
             self._draw_graph()
             self._last_graph_draw = now
+
+    def _update_overlay(self, snap: FocusSnapshot, goal: dict) -> None:
+        if self._overlay_score_label is None or self._overlay_meta_label is None:
+            return
+        color = state_color(snap.state)
+        self._overlay_score_label.configure(text=f"{snap.focus_score:.0f}", text_color=color)
+        goal_txt = "off" if not goal.get("enabled") else f"{goal.get('progress_pct', 0):.0f}%"
+        self._overlay_meta_label.configure(
+            text=f"{snap.state}  |  {self._rt_intent}  |  goal {goal_txt}"
+        )
