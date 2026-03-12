@@ -111,6 +111,7 @@ class FocusEngine:
         intent_name: str = "coding",
         baseline_enabled: bool = True,
         weekly_sessions_target: int = 5,
+        auto_intent_enabled: bool = True,
     ):
         max_entries = history_minutes * 60  # ~1 per second
         self.history: deque[FocusSnapshot] = deque(maxlen=max_entries)
@@ -122,6 +123,8 @@ class FocusEngine:
         self.weekly_sessions_target = max(1, int(weekly_sessions_target))
 
         self.current_intent = self._normalize_intent(intent_name)
+        self._manual_intent = self.current_intent  # user's explicit choice
+        self.auto_intent_enabled = bool(auto_intent_enabled)
         self.baseline_enabled = bool(baseline_enabled)
         self._baseline_buffers: dict[str, deque[float]] = {}
         self._baseline_max_samples = 3600
@@ -135,8 +138,15 @@ class FocusEngine:
         self._HYSTERESIS_MARGIN = 3.0
         self._MIN_STATE_HOLD = 2.0
 
+        # Auto-intent detection: rolling evidence buffers
+        self._auto_intent_reading_conf: deque = deque(maxlen=60)   # ~60s
+        self._auto_intent_app_history: deque = deque(maxlen=60)
+        self._auto_intent_switch_cooldown = 0.0  # don't switch too often
+        self._AUTO_INTENT_SWITCH_INTERVAL = 30.0  # seconds between auto-switches
+
     def calculate(self, eye: EyeMetrics, activity: ActivityMetrics) -> FocusSnapshot:
         """Compute focus score from the latest eye and activity metrics."""
+        self._auto_detect_intent(eye, activity)
         snap = FocusSnapshot(timestamp=time.time())
         snap.active_app = getattr(activity, "active_app", "")
         snap.app_classification = getattr(activity, "app_classification", "neutral")
@@ -245,6 +255,12 @@ class FocusEngine:
             raw_score += 2.0
         elif self.current_intent == "writing" and activity.keys_per_minute >= 15:
             raw_score += 2.0
+
+        # Fatigue penalty: high fatigue degrades maximum achievable score
+        fatigue_score = getattr(eye, "fatigue_score", 0.0)
+        if fatigue_score > 20:
+            fatigue_penalty = (fatigue_score - 20) * 0.25  # max ~20pt penalty at fatigue=100
+            raw_score = max(0, raw_score - fatigue_penalty)
 
         raw_score = max(0, min(100, raw_score))
         adjusted_score, adjustment = self._apply_personal_baseline(raw_score, self.current_intent)
@@ -360,7 +376,15 @@ class FocusEngine:
         self.weekly_sessions_target = max(1, int(sessions_per_week))
 
     def set_intent(self, intent_name: str) -> None:
-        self.current_intent = self._normalize_intent(intent_name)
+        self._manual_intent = self._normalize_intent(intent_name)
+        self.current_intent = self._manual_intent
+        # Switching manually disables auto-override until next auto cycle
+        self._auto_intent_switch_cooldown = time.time() + self._AUTO_INTENT_SWITCH_INTERVAL
+
+    def set_auto_intent_enabled(self, enabled: bool) -> None:
+        self.auto_intent_enabled = bool(enabled)
+        if not enabled:
+            self.current_intent = self._manual_intent
 
     def set_baseline_enabled(self, enabled: bool) -> None:
         self.baseline_enabled = bool(enabled)
@@ -459,6 +483,55 @@ class FocusEngine:
             "write": "writing",
         }
         return aliases.get(text, text if text in FocusEngine.INTENT_WEIGHTS else "general")
+
+    def _auto_detect_intent(self, eye: "EyeMetrics", activity: "ActivityMetrics") -> None:
+        """
+        Infer the most appropriate intent from live signals and switch if confident.
+
+        Rules (in priority order):
+        1. Reading confidence is sustained high → "reading"
+        2. Productive coding app active → "coding"
+        3. Productive writing app active → "writing"
+        4. Falls back to manual intent
+        """
+        if not self.auto_intent_enabled:
+            return
+        now = time.time()
+        if now < self._auto_intent_switch_cooldown:
+            return
+
+        self._auto_intent_reading_conf.append(float(eye.reading_confidence))
+        app = (getattr(activity, "active_app", "") or "").lower()
+        self._auto_intent_app_history.append(app)
+
+        if len(self._auto_intent_reading_conf) < 20:
+            return
+
+        avg_read = sum(self._auto_intent_reading_conf) / len(self._auto_intent_reading_conf)
+        recent_apps = list(self._auto_intent_app_history)[-20:]
+
+        # Intent inference
+        _CODING_APPS = {"code", "visual studio code", "xcode", "pycharm", "intellij",
+                        "terminal", "iterm", "iterm2", "cursor", "vim", "neovim"}
+        _WRITING_APPS = {"pages", "word", "microsoft word", "notion", "obsidian",
+                         "bear", "ulysses", "iawriter", "typora"}
+
+        dominant_app = max(set(recent_apps), key=recent_apps.count) if recent_apps else ""
+
+        if avg_read >= 0.45 and eye.is_reading:
+            inferred = "reading"
+        elif any(a in dominant_app for a in _CODING_APPS):
+            inferred = "coding"
+        elif any(a in dominant_app for a in _WRITING_APPS):
+            inferred = "writing"
+        else:
+            inferred = self._manual_intent
+
+        if inferred != self.current_intent:
+            log.debug("Auto-intent: %s → %s (read_conf=%.2f, app=%s)",
+                      self.current_intent, inferred, avg_read, dominant_app)
+            self.current_intent = inferred
+            self._auto_intent_switch_cooldown = now + self._AUTO_INTENT_SWITCH_INTERVAL
 
     def _record_baseline_sample(self, raw_score: float, intent_name: str) -> None:
         intent = self._normalize_intent(intent_name)

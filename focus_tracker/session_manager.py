@@ -16,22 +16,84 @@ from focus_tracker.focus_engine import FocusSnapshot
 
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions")
+CHECKPOINT_FILE = os.path.join(DATA_DIR, "_checkpoint.json.tmp")
 
 
 class SessionManager:
     """Handles saving and loading focus sessions."""
 
-    AUTOSAVE_INTERVAL = 60  # seconds between autosaves
+    AUTOSAVE_INTERVAL = 60   # seconds between autosaves
+    CHECKPOINT_INTERVAL = 30  # seconds between crash-recovery checkpoints
 
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
         self.session_start = time.time()
         self.session_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self._last_save = 0.0
+        self._last_checkpoint = 0.0
 
     @property
     def session_file(self) -> str:
         return os.path.join(DATA_DIR, f"session_{self.session_id}.json")
+
+    def should_checkpoint(self) -> bool:
+        return time.time() - self._last_checkpoint > self.CHECKPOINT_INTERVAL
+
+    def checkpoint_session(self, snapshots: list[FocusSnapshot], summary: dict) -> None:
+        """Write a lightweight crash-recovery checkpoint to a temp file."""
+        try:
+            data = {
+                "session_id": self.session_id,
+                "start_time": self.session_start,
+                "checkpoint_time": time.time(),
+                "summary": summary,
+                "snapshots": [
+                    {
+                        "timestamp": s.timestamp,
+                        "focus_score": round(s.focus_score, 1),
+                        "state": s.state,
+                        "active_app": s.active_app,
+                        "intent_name": s.intent_name,
+                        "goal_progress_pct": round(s.goal_progress_pct, 1),
+                    }
+                    for i, s in enumerate(snapshots) if i % 5 == 0
+                ],
+            }
+            tmp = CHECKPOINT_FILE + ".writing"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, CHECKPOINT_FILE)  # atomic rename
+            self._last_checkpoint = time.time()
+        except OSError:
+            pass  # checkpoint is best-effort
+
+    def recover_checkpoint(self) -> dict | None:
+        """
+        Check for an unfinished session checkpoint from a previous crash.
+        Returns the checkpoint data dict, or None if none exists.
+        The checkpoint is NOT deleted here — call clear_checkpoint() after the
+        user has been informed / the data is no longer needed.
+        """
+        try:
+            if not os.path.exists(CHECKPOINT_FILE):
+                return None
+            with open(CHECKPOINT_FILE) as f:
+                data = json.load(f)
+            # Only return if the checkpoint is from a different session
+            checkpoint_id = data.get("session_id", "")
+            if checkpoint_id == self.session_id:
+                return None
+            return data
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def clear_checkpoint(self) -> None:
+        """Delete the crash-recovery checkpoint file."""
+        try:
+            if os.path.exists(CHECKPOINT_FILE):
+                os.remove(CHECKPOINT_FILE)
+        except OSError:
+            pass
 
     def should_autosave(self) -> bool:
         return time.time() - self._last_save > self.AUTOSAVE_INTERVAL

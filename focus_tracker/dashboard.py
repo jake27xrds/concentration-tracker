@@ -11,6 +11,9 @@ import threading
 import subprocess
 import logging
 import math
+import os
+import json
+import sys
 import tkinter as tk
 from collections import deque
 from datetime import datetime
@@ -94,6 +97,13 @@ class FocusDashboard:
         self._overlay_window: ctk.CTkToplevel | None = None
         self._overlay_score_label: ctk.CTkLabel | None = None
         self._overlay_meta_label: ctk.CTkLabel | None = None
+
+        # Menu bar helper process
+        self._menubar_proc: subprocess.Popen | None = None
+        self._menubar_status_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "_menubar_status.json"
+        )
+        self._rt_menubar_enabled = False
 
         # Graph data buffer
         self._graph_scores: deque = deque(maxlen=600)  # 10 min at 1/sec
@@ -560,11 +570,19 @@ class FocusDashboard:
         )
 
         ctk.CTkLabel(goal_frame, text="Mini overlay HUD",
-                     text_color=COLORS["text_dim"]).grid(row=6, column=0, padx=12, pady=(4, 12), sticky="w")
+                     text_color=COLORS["text_dim"]).grid(row=6, column=0, padx=12, pady=(4, 4), sticky="w")
         self.overlay_var = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(goal_frame, text="", variable=self.overlay_var,
                       command=self._on_overlay_toggle).grid(
-            row=6, column=1, padx=12, pady=(4, 12), sticky="w"
+            row=6, column=1, padx=12, pady=(4, 4), sticky="w"
+        )
+
+        ctk.CTkLabel(goal_frame, text="Menu bar score indicator",
+                     text_color=COLORS["text_dim"]).grid(row=7, column=0, padx=12, pady=(4, 12), sticky="w")
+        self.menubar_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(goal_frame, text="", variable=self.menubar_var,
+                      command=self._on_menubar_toggle).grid(
+            row=7, column=1, padx=12, pady=(4, 12), sticky="w"
         )
 
         # Profile settings
@@ -755,6 +773,11 @@ class FocusDashboard:
         if self.eye_tracker.calibrated:
             self.cal_status.configure(text="✓ Calibration profile loaded",
                                       text_color=COLORS["deep_focus"])
+        menubar_on = bool(cfg.get("menubar_enabled", False))
+        self.menubar_var.set(menubar_on)
+        self._rt_menubar_enabled = menubar_on
+        if menubar_on:
+            self._set_menubar_enabled(True)
 
     def _save_current_config(self):
         """Persist current UI settings to disk."""
@@ -771,6 +794,7 @@ class FocusDashboard:
         self._config["active_profile"] = self.activity_monitor.active_profile
         self._config["profiles"] = self._profiles_to_config_dict()
         self._config["calibration_profile"] = dict(self.eye_tracker.calibration_profile or {})
+        self._config["menubar_enabled"] = self._rt_menubar_enabled
         save_config(self._config)
 
     def _dismiss_alert(self):
@@ -854,6 +878,7 @@ class FocusDashboard:
         self._rt_intent = self.intent_var.get()
         self._rt_baseline_enabled = bool(self.baseline_var.get())
         self._rt_overlay_enabled = bool(self.overlay_var.get())
+        self._rt_menubar_enabled = bool(self.menubar_var.get())
         self._apply_runtime_settings()
 
     def _on_distraction_threshold_change(self, _value: float | None = None) -> None:
@@ -883,6 +908,50 @@ class FocusDashboard:
     def _on_overlay_toggle(self) -> None:
         self._rt_overlay_enabled = bool(self.overlay_var.get())
         self._apply_runtime_settings()
+
+    def _on_menubar_toggle(self) -> None:
+        self._rt_menubar_enabled = bool(self.menubar_var.get())
+        self._set_menubar_enabled(self._rt_menubar_enabled)
+        self._save_current_config()
+
+    def _set_menubar_enabled(self, enabled: bool) -> None:
+        if enabled:
+            if self._menubar_proc is None or self._menubar_proc.poll() is not None:
+                self._menubar_proc = subprocess.Popen(
+                    [sys.executable, "-m", "focus_tracker.menubar_helper"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+        else:
+            self._stop_menubar()
+
+    def _stop_menubar(self) -> None:
+        if self._menubar_proc is not None:
+            try:
+                self._menubar_proc.terminate()
+            except OSError:
+                pass
+            self._menubar_proc = None
+        try:
+            if os.path.exists(self._menubar_status_file):
+                os.remove(self._menubar_status_file)
+        except OSError:
+            pass
+
+    def _write_menubar_status(self, snap: FocusSnapshot, alert: AlertState) -> None:
+        """Write current status to the shared JSON file read by the menu bar helper."""
+        try:
+            data = {
+                "score": round(snap.focus_score, 1),
+                "state": snap.state,
+                "intent": snap.intent_name,
+                "streak_min": round(alert.current_streak_minutes, 1),
+            }
+            tmp = self._menubar_status_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._menubar_status_file)
+        except OSError:
+            pass
 
     def _profiles_to_config_dict(self) -> dict:
         out = {}
@@ -1023,6 +1092,9 @@ class FocusDashboard:
                      f"(blink threshold: {self.eye_tracker.EAR_BLINK_THRESHOLD:.3f})",
                 text_color=COLORS["deep_focus"]
             )
+            # Persist so it's auto-applied next launch
+            self._config["calibration_profile"] = dict(self.eye_tracker.calibration_profile or {})
+            save_config(self._config)
         else:
             self.cal_status.configure(
                 text="✗ Calibration failed — no face detected. Try again.",
@@ -1108,6 +1180,7 @@ class FocusDashboard:
         for widget in self.analytics_scroll.winfo_children():
             widget.destroy()
 
+        sessions = self.session_manager.load_recent_sessions(max_sessions=40)
         hourly = self.session_manager.aggregate_hourly_focus(max_sessions=40)
         impact = self.session_manager.aggregate_app_impact(max_sessions=40, top_n=8)
         windows = self.session_manager.detect_distraction_windows(max_sessions=40)
@@ -1123,96 +1196,243 @@ class FocusDashboard:
             return
 
         row = 0
-        ctk.CTkLabel(self.analytics_scroll, text="Focus By Hour",
-                     font=ctk.CTkFont(size=14, weight="bold"),
-                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
-        row += 1
-        for item in hourly[:24]:
-            heat = "█" * max(1, min(10, int(item["avg_score"] // 10)))
-            ctk.CTkLabel(
-                self.analytics_scroll,
-                text=f"{item['hour']:02d}:00  {heat}  avg={item['avg_score']:.1f}  n={item['samples']}",
-                font=ctk.CTkFont(family="Menlo", size=11),
-                text_color=COLORS["text_dim"],
-            ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+
+        # ── Session Trend (line chart of avg score per session) ──────────────
+        if sessions:
+            ctk.CTkLabel(self.analytics_scroll, text="Session Trend",
+                         font=ctk.CTkFont(size=14, weight="bold"),
+                         text_color=COLORS["text"]).grid(
+                row=row, column=0, padx=10, pady=(12, 4), sticky="w")
             row += 1
 
-        row += 1
-        ctk.CTkLabel(self.analytics_scroll, text="App/Profile Impact",
-                     font=ctk.CTkFont(size=14, weight="bold"),
-                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
-        row += 1
-        for app in impact.get("top_apps", [])[:8]:
-            ctk.CTkLabel(
-                self.analytics_scroll,
-                text=f"{app['key'][:38]:<38}  avg={app['avg_score']:.1f}  n={app['samples']}",
-                font=ctk.CTkFont(family="Menlo", size=11),
-                text_color=COLORS["text_dim"],
-            ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+            trend_canvas = tk.Canvas(
+                self.analytics_scroll, bg=COLORS["graph_bg"],
+                height=100, highlightthickness=0
+            )
+            trend_canvas.grid(row=row, column=0, padx=10, pady=(0, 8), sticky="ew")
+            # Draw after layout settles
+            self.analytics_scroll.update_idletasks()
+            self._draw_session_trend(trend_canvas, sessions)
             row += 1
 
+        # ── Focus By Hour (coloured bars) ────────────────────────────────────
+        ctk.CTkLabel(self.analytics_scroll, text="Focus By Hour of Day",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=COLORS["text"]).grid(
+            row=row, column=0, padx=10, pady=(8, 4), sticky="w")
+        row += 1
+
+        hour_frame = ctk.CTkFrame(self.analytics_scroll, fg_color=COLORS["bg_card"],
+                                   corner_radius=8)
+        hour_frame.grid(row=row, column=0, padx=10, pady=(0, 8), sticky="ew")
+        hour_frame.grid_columnconfigure(2, weight=1)
+
+        for i, item in enumerate(hourly[:24]):
+            score = item["avg_score"]
+            bar_color = (
+                COLORS["deep_focus"] if score >= 80
+                else COLORS["focused"] if score >= 60
+                else COLORS["neutral"] if score >= 40
+                else COLORS["distracted"]
+            )
+            ctk.CTkLabel(hour_frame, text=f"{item['hour']:02d}:00",
+                         font=ctk.CTkFont(family="Menlo", size=11),
+                         text_color=COLORS["text_dim"], width=48).grid(
+                row=i, column=0, padx=(10, 4), pady=2, sticky="w")
+            bar = ctk.CTkProgressBar(hour_frame, height=8, corner_radius=3,
+                                      progress_color=bar_color,
+                                      fg_color=COLORS["bg_card_alt"],
+                                      width=200)
+            bar.set(score / 100.0)
+            bar.grid(row=i, column=1, padx=4, pady=2, sticky="w")
+            ctk.CTkLabel(hour_frame,
+                         text=f"{score:.0f}  (n={item['samples']})",
+                         font=ctk.CTkFont(family="Menlo", size=10),
+                         text_color=COLORS["text_dim"]).grid(
+                row=i, column=2, padx=(4, 10), pady=2, sticky="w")
+        row += 1
+
+        # ── App Impact (coloured bars) ────────────────────────────────────────
+        top_apps = impact.get("top_apps", [])[:8]
+        if top_apps:
+            ctk.CTkLabel(self.analytics_scroll, text="App Impact on Focus",
+                         font=ctk.CTkFont(size=14, weight="bold"),
+                         text_color=COLORS["text"]).grid(
+                row=row, column=0, padx=10, pady=(8, 4), sticky="w")
+            row += 1
+
+            app_frame = ctk.CTkFrame(self.analytics_scroll, fg_color=COLORS["bg_card"],
+                                      corner_radius=8)
+            app_frame.grid(row=row, column=0, padx=10, pady=(0, 8), sticky="ew")
+            app_frame.grid_columnconfigure(2, weight=1)
+
+            for i, app in enumerate(top_apps):
+                score = app["avg_score"]
+                bar_color = (
+                    COLORS["deep_focus"] if score >= 70
+                    else COLORS["neutral"] if score >= 50
+                    else COLORS["distracted"]
+                )
+                name = (app["key"] or "Unknown")[:28]
+                ctk.CTkLabel(app_frame, text=name,
+                             font=ctk.CTkFont(size=11),
+                             text_color=COLORS["text_dim"], width=180,
+                             anchor="w").grid(row=i, column=0, padx=(10, 4), pady=2, sticky="w")
+                bar = ctk.CTkProgressBar(app_frame, height=8, corner_radius=3,
+                                          progress_color=bar_color,
+                                          fg_color=COLORS["bg_card_alt"],
+                                          width=180)
+                bar.set(score / 100.0)
+                bar.grid(row=i, column=1, padx=4, pady=2, sticky="w")
+                ctk.CTkLabel(app_frame,
+                             text=f"{score:.0f}  (n={app['samples']})",
+                             font=ctk.CTkFont(family="Menlo", size=10),
+                             text_color=COLORS["text_dim"]).grid(
+                    row=i, column=2, padx=(4, 10), pady=2, sticky="w")
+            row += 1
+
+        # ── Intent Impact ─────────────────────────────────────────────────────
         intent_rows = impact.get("by_intent", [])[:5]
         if intent_rows:
-            row += 1
             ctk.CTkLabel(self.analytics_scroll, text="Intent Impact",
                          font=ctk.CTkFont(size=14, weight="bold"),
-                         text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
+                         text_color=COLORS["text"]).grid(
+                row=row, column=0, padx=10, pady=(8, 4), sticky="w")
             row += 1
-            for intent in intent_rows:
+            intent_frame = ctk.CTkFrame(self.analytics_scroll, fg_color=COLORS["bg_card"],
+                                         corner_radius=8)
+            intent_frame.grid(row=row, column=0, padx=10, pady=(0, 8), sticky="ew")
+            intent_frame.grid_columnconfigure(2, weight=1)
+            for i, intent in enumerate(intent_rows):
+                score = intent["avg_score"]
+                bar_color = (
+                    COLORS["deep_focus"] if score >= 70
+                    else COLORS["neutral"] if score >= 50
+                    else COLORS["distracted"]
+                )
+                ctk.CTkLabel(intent_frame, text=intent["key"].capitalize(),
+                             font=ctk.CTkFont(size=11), text_color=COLORS["text_dim"],
+                             width=80, anchor="w").grid(row=i, column=0, padx=(10, 4), pady=2, sticky="w")
+                bar = ctk.CTkProgressBar(intent_frame, height=8, corner_radius=3,
+                                          progress_color=bar_color,
+                                          fg_color=COLORS["bg_card_alt"], width=180)
+                bar.set(score / 100.0)
+                bar.grid(row=i, column=1, padx=4, pady=2, sticky="w")
+                ctk.CTkLabel(intent_frame,
+                             text=f"{score:.0f}  (n={intent['samples']})",
+                             font=ctk.CTkFont(family="Menlo", size=10),
+                             text_color=COLORS["text_dim"]).grid(
+                    row=i, column=2, padx=(4, 10), pady=2, sticky="w")
+            row += 1
+
+        # ── Top Distraction Windows ───────────────────────────────────────────
+        if windows:
+            ctk.CTkLabel(self.analytics_scroll, text="Top Distraction Windows",
+                         font=ctk.CTkFont(size=14, weight="bold"),
+                         text_color=COLORS["text"]).grid(
+                row=row, column=0, padx=10, pady=(8, 4), sticky="w")
+            row += 1
+            for win in windows[:6]:
+                reasons = ", ".join(win.get("nudge_reasons", [])) or "low-score cluster"
                 ctk.CTkLabel(
                     self.analytics_scroll,
-                    text=f"{intent['key']:<12}  avg={intent['avg_score']:.1f}  n={intent['samples']}",
-                    font=ctk.CTkFont(family="Menlo", size=11),
-                    text_color=COLORS["text_dim"],
+                    text=f"{win['session_id']}  •  {win['duration_sec']:.0f}s  •  avg {win['avg_score']:.0f}  •  {reasons}",
+                    font=ctk.CTkFont(size=11), text_color=COLORS["distracted"],
+                    wraplength=900, justify="left",
                 ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
                 row += 1
-
-        row += 1
-        ctk.CTkLabel(self.analytics_scroll, text="Top Distraction Windows",
-                     font=ctk.CTkFont(size=14, weight="bold"),
-                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
-        row += 1
-        for win in windows[:8]:
-            reasons = ", ".join(win.get("nudge_reasons", [])) or "low-score cluster"
-            ctk.CTkLabel(
-                self.analytics_scroll,
-                text=f"{win['session_id']}  {win['duration_sec']:.0f}s  avg={win['avg_score']:.1f}  ({reasons})",
-                font=ctk.CTkFont(size=11),
-                text_color=COLORS["text_dim"],
-                wraplength=900,
-                justify="left",
-            ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
             row += 1
 
-        row += 1
+        # ── Goal Achievement ──────────────────────────────────────────────────
         ctk.CTkLabel(self.analytics_scroll, text="Goal Achievement",
                      font=ctk.CTkFont(size=14, weight="bold"),
-                     text_color=COLORS["text"]).grid(row=row, column=0, padx=10, pady=(8, 3), sticky="w")
+                     text_color=COLORS["text"]).grid(
+            row=row, column=0, padx=10, pady=(8, 4), sticky="w")
         row += 1
+
+        goal_frame = ctk.CTkFrame(self.analytics_scroll, fg_color=COLORS["bg_card"],
+                                   corner_radius=8)
+        goal_frame.grid(row=row, column=0, padx=10, pady=(0, 12), sticky="ew")
+        goal_frame.grid_columnconfigure(1, weight=1)
+
         milestone_hits = goals.get("milestone_hits", {})
-        ctk.CTkLabel(
-            self.analytics_scroll,
-            text=(
-                f"sessions={goals.get('sessions', 0)}  "
-                f"avg goal={goals.get('avg_goal_completion_pct', 0):.1f}%  "
-                f"consistency={goals.get('avg_consistency_score', 0):.1f}%  "
-                f"goal-hit={goals.get('full_goal_hit_pct', 0):.1f}%"
-            ),
-            font=ctk.CTkFont(family="Menlo", size=11),
-            text_color=COLORS["text_dim"],
-        ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
-        row += 1
-        ctk.CTkLabel(
-            self.analytics_scroll,
-            text=(
-                f"milestones 25%={milestone_hits.get('25', 0)}  "
-                f"50%={milestone_hits.get('50', 0)}  "
-                f"75%={milestone_hits.get('75', 0)}  "
-                f"100%={milestone_hits.get('100', 0)}"
-            ),
-            font=ctk.CTkFont(family="Menlo", size=11),
-            text_color=COLORS["text_dim"],
-        ).grid(row=row, column=0, padx=12, pady=1, sticky="w")
+        stats = [
+            ("Sessions analysed", str(goals.get("sessions", 0))),
+            ("Avg goal completion", f"{goals.get('avg_goal_completion_pct', 0):.1f}%"),
+            ("Avg consistency", f"{goals.get('avg_consistency_score', 0):.1f}%"),
+            ("Full goal hit rate", f"{goals.get('full_goal_hit_pct', 0):.1f}%"),
+            ("Milestones 25 / 50 / 75 / 100%",
+             f"{milestone_hits.get('25', 0)} / {milestone_hits.get('50', 0)} / "
+             f"{milestone_hits.get('75', 0)} / {milestone_hits.get('100', 0)}"),
+        ]
+        for i, (label, value) in enumerate(stats):
+            ctk.CTkLabel(goal_frame, text=label, font=ctk.CTkFont(size=11),
+                         text_color=COLORS["text_dim"]).grid(
+                row=i, column=0, padx=(12, 8), pady=3, sticky="w")
+            ctk.CTkLabel(goal_frame, text=value,
+                         font=ctk.CTkFont(family="Menlo", size=11, weight="bold"),
+                         text_color=COLORS["text"]).grid(
+                row=i, column=1, padx=(0, 12), pady=3, sticky="w")
+
+    def _draw_session_trend(self, canvas: tk.Canvas, sessions: list[dict]) -> None:
+        """Draw a line chart of avg focus score across recent sessions."""
+        canvas.update_idletasks()
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 20 or h < 20:
+            w, h = 800, 100
+
+        canvas.delete("all")
+        # Most recent last → chronological order
+        data = list(reversed(sessions))
+        scores = [s.get("summary", {}).get("avg_score", 0) or 0 for s in data]
+        if len(scores) < 2:
+            canvas.create_text(w // 2, h // 2, text="Need ≥ 2 sessions",
+                               fill=COLORS["text_dim"], font=("Menlo", 11))
+            return
+
+        ml, mr, mt, mb = 36, 12, 8, 20
+        pw = w - ml - mr
+        ph = h - mt - mb
+
+        # Grid
+        for v in [0, 50, 100]:
+            y = mt + ph * (1 - v / 100)
+            canvas.create_line(ml, y, w - mr, y, fill=COLORS["graph_grid"])
+            canvas.create_text(ml - 4, y, text=str(v), fill=COLORS["text_dim"],
+                               font=("Menlo", 8), anchor="e")
+
+        # Line
+        n = len(scores)
+        coords = []
+        for i, score in enumerate(scores):
+            x = ml + (i / (n - 1)) * pw
+            y = mt + ph * (1 - score / 100)
+            coords.append((x, y))
+
+        for i in range(len(coords) - 1):
+            score = scores[i]
+            color = (COLORS["deep_focus"] if score >= 80
+                     else COLORS["focused"] if score >= 60
+                     else COLORS["neutral"] if score >= 40
+                     else COLORS["distracted"])
+            canvas.create_line(coords[i][0], coords[i][1],
+                               coords[i + 1][0], coords[i + 1][1],
+                               fill=color, width=2, smooth=True)
+
+        # Dots + session labels
+        for i, (x, y) in enumerate(coords):
+            score = scores[i]
+            color = (COLORS["deep_focus"] if score >= 80
+                     else COLORS["focused"] if score >= 60
+                     else COLORS["neutral"] if score >= 40
+                     else COLORS["distracted"])
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline="")
+            if i == 0 or i == len(coords) - 1 or n <= 8:
+                sid = data[i].get("session_id", "")
+                label = sid[5:10] if len(sid) >= 10 else sid  # show MM-DD
+                canvas.create_text(x, h - 4, text=label, fill=COLORS["text_dim"],
+                                   font=("Menlo", 7))
 
     def _build_analytics_tab(self):
         tab = self.tab_analytics
@@ -1413,6 +1633,7 @@ class FocusDashboard:
         """Save session and settings, then close."""
         self._running = False
         self._set_overlay_enabled(False)
+        self._stop_menubar()
         # Save settings
         self._save_current_config()
         # Final save
@@ -1451,11 +1672,18 @@ class FocusDashboard:
 
                 self._apply_runtime_settings()
 
+                # Checkpoint (crash recovery)
+                if self.session_manager.should_checkpoint():
+                    snapshots = list(self.focus_engine.history)
+                    summary = self.focus_engine.get_session_summary()
+                    self.session_manager.checkpoint_session(snapshots, summary)
+
                 # Autosave
                 if self.session_manager.should_autosave():
                     snapshots = list(self.focus_engine.history)
                     summary = self.focus_engine.get_session_summary()
                     self.session_manager.save_session(snapshots, summary)
+                    self.session_manager.clear_checkpoint()
 
                 consecutive_errors = 0
 
@@ -1525,9 +1753,17 @@ class FocusDashboard:
         secs = int(elapsed % 60)
         self.session_time_label.configure(text=f"{mins}:{secs:02d}")
 
-        # Reading mode indicator in top bar
+        # Reading / intent indicator in top bar
+        auto_intent = snap.intent_name.lower()
+        manual_intent = self.focus_engine._manual_intent
+        intent_changed = (auto_intent != manual_intent and self.focus_engine.auto_intent_enabled)
         if eye.is_reading and eye.reading_confidence > 0.3:
-            self.reading_label.configure(text=f"reading {eye.reading_confidence:.0%}")
+            self.reading_label.configure(
+                text=f"📖 reading {eye.reading_confidence:.0%}"
+                     + (f"  · auto→{auto_intent}" if intent_changed else "")
+            )
+        elif intent_changed:
+            self.reading_label.configure(text=f"auto→{auto_intent}")
         else:
             self.reading_label.configure(text="")
 
@@ -1571,11 +1807,17 @@ class FocusDashboard:
             cal_str = "✓ Calibrated" if self.eye_tracker.calibrated else "Default"
             screen_str = "👁 Screen" if eye.looking_at_screen else "👀 Away"
             reading_str = f"  📖 Reading ({eye.reading_confidence:.0%})" if eye.is_reading else ""
+            fatigue_level = getattr(eye, "fatigue_level", "None")
+            fatigue_score = getattr(eye, "fatigue_score", 0.0)
+            fatigue_str = (
+                f"  😴 Fatigue: {fatigue_level} ({fatigue_score:.0f})"
+                if fatigue_level != "None" else ""
+            )
             eye_text = (
                 f"EAR: {eye.avg_ear:.3f}  ({cal_str})  |  Blinks/min: {eye.blinks_per_minute:.0f}\n"
                 f"Gaze: H={eye.gaze_horizontal:+.2f}  V={eye.gaze_vertical:+.2f}  |  "
                 f"Head: Yaw={eye.head_yaw:+.2f}  Pitch={eye.head_pitch:+.2f}\n"
-                f"Attention: {eye.attention_h:+.2f},{eye.attention_v:+.2f}  {screen_str}{reading_str}"
+                f"Attention: {eye.attention_h:+.2f},{eye.attention_v:+.2f}  {screen_str}{reading_str}{fatigue_str}"
             )
             if eye.eyes_closed_duration > 0.5:
                 eye_text += f"\n⚠ Eyes closed: {eye.eyes_closed_duration:.1f}s"
@@ -1633,6 +1875,9 @@ class FocusDashboard:
 
         if self._overlay_window is not None and self._overlay_window.winfo_exists():
             self._update_overlay(snap, goal)
+
+        if self._rt_menubar_enabled:
+            self._write_menubar_status(snap, alert)
 
         # --- Graph (throttled to 1/sec) ---
         now = time.time()

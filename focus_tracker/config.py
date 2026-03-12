@@ -36,6 +36,8 @@ DEFAULTS = {
     "active_intent": "coding",
     "baseline_enabled": True,
     "overlay_enabled": False,
+    "menubar_enabled": False,
+    "auto_intent_enabled": True,
     "fatigue_break_enabled": True,
     "nudge_cooldowns_sec": {
         "prolonged_distraction": 45,

@@ -12,6 +12,12 @@ from dataclasses import dataclass, field
 
 import cv2
 import mediapipe as mp
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None  # type: ignore[assignment]
+    _PSUTIL_AVAILABLE = False
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import (
     FaceLandmarker,
@@ -54,6 +60,9 @@ class EyeMetrics:
     # Reading detection
     is_reading: bool = False
     reading_confidence: float = 0.0
+    # Fatigue / drowsiness
+    fatigue_score: float = 0.0      # 0-100; higher = more fatigued
+    fatigue_level: str = "None"     # "None", "Mild", "Moderate", "High"
 
 
 # MediaPipe Face Mesh landmark indices for eyes
@@ -204,6 +213,103 @@ class ReadingDetector:
         return is_reading, round(avg, 3)
 
 
+class FatigueDetector:
+    """
+    Detects eye fatigue / drowsiness from EAR trend, blink rate, and head pitch drift.
+
+    Produces a fatigue_score (0-100) and fatigue_level label.
+
+    Signals tracked:
+    - EAR decline over time (eyes getting heavier → closing more)
+    - High blink rate (>28/min) or very low blink rate (<4/min, stare-fatigue)
+    - Accumulating prolonged eye-closures (micro-sleep events)
+    - Head pitch creep upward (head drooping forward)
+    - Session duration factor (fatigue increases naturally over time)
+    """
+
+    _WINDOW = 120  # seconds of history to analyse
+
+    def __init__(self):
+        # Rolling buffer of (timestamp, ear, blinks_per_min, pitch, closed_duration)
+        self._samples: deque = deque(maxlen=self._WINDOW * 2)  # ~2 samples/sec max
+        self._accumulated_closure: float = 0.0   # total prolonged-closed seconds
+        self._session_start: float = time.time()
+
+    def update(
+        self,
+        timestamp: float,
+        avg_ear: float,
+        blinks_per_minute: float,
+        head_pitch: float,
+        eyes_closed_duration: float,
+        face_detected: bool,
+    ) -> tuple[float, str]:
+        """Feed current frame data. Returns (fatigue_score 0-100, fatigue_level label)."""
+        if not face_detected:
+            return 0.0, "None"
+
+        self._samples.append((timestamp, avg_ear, blinks_per_minute, head_pitch))
+
+        # Accumulate prolonged closures (events > 0.8s)
+        if eyes_closed_duration > 0.8:
+            self._accumulated_closure += 0.05  # approx per-frame contribution
+
+        score = self._compute_score(timestamp)
+        level = (
+            "High" if score >= 65
+            else "Moderate" if score >= 40
+            else "Mild" if score >= 20
+            else "None"
+        )
+        return round(score, 1), level
+
+    def _compute_score(self, now: float) -> float:
+        if len(self._samples) < 10:
+            return 0.0
+
+        cutoff = now - self._WINDOW
+        recent = [(t, e, b, p) for t, e, b, p in self._samples if t >= cutoff]
+        if len(recent) < 5:
+            return 0.0
+
+        score = 0.0
+
+        # 1. EAR decline — compare first quarter vs last quarter of window
+        half = len(recent) // 2
+        if half >= 3:
+            ear_early = sum(s[1] for s in recent[:half]) / half
+            ear_late = sum(s[1] for s in recent[half:]) / (len(recent) - half)
+            ear_drop = ear_early - ear_late  # positive = eyes closing more over time
+            score += max(0.0, min(35.0, ear_drop * 200))  # max 35 pts
+
+        # 2. Blink rate — both extremes are fatigue signals
+        bpm_vals = [s[2] for s in recent if s[2] > 0]
+        if bpm_vals:
+            avg_bpm = sum(bpm_vals) / len(bpm_vals)
+            if avg_bpm > 28:
+                score += min(25.0, (avg_bpm - 28) * 1.5)  # high rate = tired
+            elif avg_bpm < 4:
+                score += min(15.0, (4 - avg_bpm) * 5.0)    # low rate = stare fatigue
+
+        # 3. Head pitch creep (drooping)
+        pitches = [s[3] for s in recent]
+        if len(pitches) >= 6:
+            early_pitch = sum(pitches[:len(pitches) // 3]) / (len(pitches) // 3)
+            late_pitch = sum(pitches[-len(pitches) // 3:]) / (len(pitches) // 3)
+            pitch_creep = late_pitch - early_pitch  # positive = head drooping
+            score += max(0.0, min(20.0, pitch_creep * 80))  # max 20 pts
+
+        # 4. Accumulated micro-sleep events
+        score += min(20.0, self._accumulated_closure * 2)
+
+        # 5. Session duration factor (mild fatigue accumulates over time)
+        session_hours = (time.time() - self._session_start) / 3600
+        duration_factor = min(10.0, session_hours * 6)
+        score += duration_factor
+
+        return max(0.0, min(100.0, score))
+
+
 class EyeTracker:
     """Tracks eyes using webcam + MediaPipe and produces focus-related metrics."""
 
@@ -266,6 +372,14 @@ class EyeTracker:
         # Reading detector
         self._reading_detector = ReadingDetector()
         self._calibration_session: dict | None = None
+
+        # Fatigue detector
+        self._fatigue_detector = FatigueDetector()
+
+        # Adaptive FPS governor
+        self._target_fps: float = 30.0
+        self._last_frame_time: float = 0.0
+        self._cpu_check_counter: int = 0  # check CPU every N frames
 
         self._running = False
 
@@ -482,6 +596,11 @@ class EyeTracker:
         if not self._running or self.cap is None:
             return EyeMetrics()
 
+        sleep_s = self._update_adaptive_fps()
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+        self._last_frame_time = time.time()
+
         ret, frame = self.cap.read()
         if not ret:
             return self.latest_metrics
@@ -577,6 +696,18 @@ class EyeTracker:
             metrics.is_reading = is_reading
             metrics.reading_confidence = reading_conf
 
+            # --- Fatigue Detection ---
+            fatigue_score, fatigue_level = self._fatigue_detector.update(
+                timestamp=metrics.timestamp,
+                avg_ear=avg_ear,
+                blinks_per_minute=metrics.blinks_per_minute,
+                head_pitch=metrics.head_pitch,
+                eyes_closed_duration=metrics.eyes_closed_duration,
+                face_detected=True,
+            )
+            metrics.fatigue_score = fatigue_score
+            metrics.fatigue_level = fatigue_level
+
             # --- Annotate frame ---
             self._annotate(frame, pts, metrics)
 
@@ -613,6 +744,32 @@ class EyeTracker:
         self.annotated_frame = frame
         self.latest_metrics = metrics
         return metrics
+
+    def _update_adaptive_fps(self) -> float:
+        """
+        Compute the minimum inter-frame sleep based on current CPU load.
+        Returns seconds to sleep before capturing the next frame.
+        - CPU < 50% → 30 fps (0.033s)
+        - CPU 50-70% → 20 fps (0.050s)
+        - CPU 70-85% → 15 fps (0.067s)
+        - CPU > 85%  → 10 fps (0.100s)
+        """
+        self._cpu_check_counter += 1
+        if _PSUTIL_AVAILABLE and self._cpu_check_counter % 30 == 0:
+            cpu = psutil.cpu_percent(interval=None)
+            if cpu >= 85:
+                self._target_fps = 10.0
+            elif cpu >= 70:
+                self._target_fps = 15.0
+            elif cpu >= 50:
+                self._target_fps = 20.0
+            else:
+                self._target_fps = 30.0
+
+        min_interval = 1.0 / self._target_fps
+        elapsed = time.time() - self._last_frame_time
+        sleep_needed = max(0.0, min_interval - elapsed)
+        return sleep_needed
 
     # ---- Internal helpers ----
 

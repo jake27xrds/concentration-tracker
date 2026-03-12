@@ -6,3 +6,5 @@ pyobjc-framework-ApplicationServices>=9.0
 pynput>=1.7.6
 customtkinter>=5.2.0
 Pillow>=10.0.0
+psutil>=5.9.0
+rumps>=0.4.0

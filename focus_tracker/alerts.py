@@ -6,6 +6,7 @@ Monitors focus state and triggers alerts/reminders.
 import time
 import subprocess
 import platform
+from collections import deque
 from dataclasses import dataclass
 
 from focus_tracker.focus_engine import FocusSnapshot
@@ -80,6 +81,9 @@ class AlertManager:
         self._streak_start: float | None = None
         self._best_streak = 0.0
 
+        # Adaptive break: rolling state quality during the current focused streak
+        self._streak_state_samples: deque = deque(maxlen=600)  # ~10min at 1/sec
+
     def update(self, snapshot: FocusSnapshot, eye_metrics=None, activity_metrics=None, goal_progress: dict | None = None) -> AlertState:
         """Update alert state based on the latest focus snapshot."""
         now = snapshot.timestamp
@@ -119,38 +123,43 @@ class AlertManager:
             self.state.distraction_alert_active = False
             self.state.distraction_alert_message = ""
 
-        # --- Break Reminder ---
+        # --- Break Reminder (adaptive Pomodoro) ---
         if state in ("Deep Focus", "Focused"):
             if self.state.focused_since == 0:
                 self.state.focused_since = now
+                self._streak_state_samples.clear()
+            self._streak_state_samples.append(state)
             elapsed = now - self.state.focused_since
 
-            # Don't remind if they just took a break
+            # Compute adaptive break interval based on focus quality
+            adaptive_interval = self._adaptive_break_interval()
+
             time_since_break = now - self._break_taken_at
-            if elapsed >= self.break_interval and time_since_break > self.break_interval:
+            if elapsed >= adaptive_interval and time_since_break > adaptive_interval:
                 self.state.break_reminder_active = True
                 minutes = int(elapsed // 60)
+                quality_tag = self._streak_quality_label()
                 self.state.break_reminder_message = (
-                    f"🧘 Great focus for {minutes} minutes! "
-                    f"Consider a {self.break_duration // 60}-minute break."
+                    f"🧘 {quality_tag} streak — {minutes} min focused! "
+                    f"Take a {self.break_duration // 60}-min break."
                 )
                 self._play_break_sound()
                 self._maybe_fire_nudge(
                     now,
                     "break_due",
                     self.state.break_reminder_message,
-                    "Sustained focus reached break interval",
+                    "Sustained focus reached adaptive break interval",
                 )
             else:
                 self.state.break_reminder_active = False
                 self.state.break_reminder_message = ""
         else:
             if self.state.focused_since > 0:
-                # Track the focus streak that just ended
                 streak = now - self.state.focused_since
                 if streak > self._best_streak:
                     self._best_streak = streak
             self.state.focused_since = 0
+            self._streak_state_samples.clear()
             self.state.break_reminder_active = False
             self.state.break_reminder_message = ""
 
@@ -192,6 +201,45 @@ class AlertManager:
         )
 
         return self.state
+
+    def _adaptive_break_interval(self) -> float:
+        """
+        Return the break interval (seconds) tuned to current streak quality.
+
+        Adaptation only kicks in when the base interval is ≥ 15 minutes, ensuring
+        that short configured intervals (e.g. for testing) are never affected.
+
+        Deep Focus streak (>70% Deep Focus readings) → reward with longer focus time (+5 min)
+        Focused streak (>60% Focused+DeepFocus)      → use configured interval
+        Mixed / low quality streak                   → suggest break sooner (-5 min)
+        """
+        if len(self._streak_state_samples) < 30 or self.break_interval < 15 * 60:
+            return self.break_interval  # not enough data, or short interval — no adaptation
+
+        samples = list(self._streak_state_samples)
+        deep_pct = samples.count("Deep Focus") / len(samples)
+        focused_pct = (samples.count("Deep Focus") + samples.count("Focused")) / len(samples)
+
+        if deep_pct >= 0.70:
+            return self.break_interval + 5 * 60   # +5 min for deep quality
+        elif focused_pct >= 0.60:
+            return self.break_interval             # normal
+        else:
+            return max(10 * 60, self.break_interval - 5 * 60)  # -5 min (floor 10 min)
+
+    def _streak_quality_label(self) -> str:
+        """Return a human-readable label for the current streak quality."""
+        if len(self._streak_state_samples) < 10:
+            return "Good"
+        samples = list(self._streak_state_samples)
+        deep_pct = samples.count("Deep Focus") / len(samples)
+        focused_pct = (samples.count("Deep Focus") + samples.count("Focused")) / len(samples)
+        if deep_pct >= 0.70:
+            return "Deep focus"
+        elif focused_pct >= 0.60:
+            return "Solid"
+        else:
+            return "Mixed"
 
     def acknowledge_break(self):
         """User acknowledges the break reminder — reset timer."""
