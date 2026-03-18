@@ -93,6 +93,8 @@ class FocusDashboard:
         self._rt_active_profile = "Coding"
         self._rt_intent = "coding"
         self._rt_baseline_enabled = True
+        self._rt_posture_grace_seconds = 12
+        self._rt_distracted_confirm_seconds = 8
         self._rt_overlay_enabled = False
         self._overlay_window: ctk.CTkToplevel | None = None
         self._overlay_score_label: ctk.CTkLabel | None = None
@@ -758,6 +760,8 @@ class FocusDashboard:
         self.goal_slider.set(cfg.get("goal_minutes_target", 45))
         self.intent_var.set(str(cfg.get("active_intent", "coding")))
         self.baseline_var.set(bool(cfg.get("baseline_enabled", True)))
+        self._rt_posture_grace_seconds = int(cfg.get("posture_grace_seconds", 12))
+        self._rt_distracted_confirm_seconds = int(cfg.get("distracted_confirm_seconds", 8))
         self.overlay_var.set(bool(cfg.get("overlay_enabled", False)))
         self.alert_manager.fatigue_break_enabled = cfg.get("fatigue_break_enabled", True)
         self.alert_manager._nudge_cooldowns = dict(cfg.get("nudge_cooldowns_sec", {}))
@@ -788,6 +792,8 @@ class FocusDashboard:
         self._config["goal_minutes_target"] = int(self.goal_slider.get())
         self._config["active_intent"] = self.intent_var.get()
         self._config["baseline_enabled"] = self.baseline_var.get()
+        self._config["posture_grace_seconds"] = int(self._rt_posture_grace_seconds)
+        self._config["distracted_confirm_seconds"] = int(self._rt_distracted_confirm_seconds)
         self._config["overlay_enabled"] = self.overlay_var.get()
         self._config["fatigue_break_enabled"] = self.alert_manager.fatigue_break_enabled
         self._config["nudge_cooldowns_sec"] = dict(self.alert_manager._nudge_cooldowns)
@@ -865,6 +871,10 @@ class FocusDashboard:
         self.focus_engine.set_weekly_sessions_target(int(self._config.get("weekly_sessions_target", 5)))
         self.focus_engine.set_intent(self._rt_intent)
         self.focus_engine.set_baseline_enabled(self._rt_baseline_enabled)
+        self.focus_engine.set_state_timing(
+            posture_grace_seconds=self._rt_posture_grace_seconds,
+            distracted_confirm_seconds=self._rt_distracted_confirm_seconds,
+        )
         if self._rt_active_profile != self.activity_monitor.active_profile:
             self.activity_monitor.set_active_profile(self._rt_active_profile)
         self._set_overlay_enabled(self._rt_overlay_enabled)

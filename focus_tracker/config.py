@@ -35,6 +35,8 @@ DEFAULTS = {
     "weekly_sessions_target": 5,
     "active_intent": "coding",
     "baseline_enabled": True,
+    "posture_grace_seconds": 12,
+    "distracted_confirm_seconds": 8,
     "overlay_enabled": False,
     "menubar_enabled": False,
     "auto_intent_enabled": True,

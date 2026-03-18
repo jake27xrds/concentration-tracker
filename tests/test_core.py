@@ -268,6 +268,59 @@ class TestFocusEngine:
         frantic = engine2.calculate(eye, _make_activity(app_switches_per_minute=15))
         assert frantic.activity_score < calm.activity_score
 
+    def test_posture_shift_grace_avoids_false_distracted(self):
+        """Leaning-back posture with activity should stay Neutral initially."""
+        engine = FocusEngine()
+        engine._state_entered_at = time.time() - 10
+
+        eye = _make_eye(
+            looking_at_screen=False,
+            attention_h=0.08,
+            attention_v=0.60,
+            head_pitch=0.35,
+            head_frontal_confidence=0.45,
+        )
+        act = _make_activity(
+            app_classification="distracting",
+            in_productive_app=False,
+            keys_per_minute=18,
+            mouse_moves_per_minute=25,
+            total_idle_seconds=4,
+        )
+
+        snap = engine.calculate(eye, act)
+        assert snap.state == "Neutral"
+
+    def test_distracted_requires_sustained_evidence(self):
+        """Strong away + low engagement should confirm as Distracted only after delay."""
+        engine = FocusEngine()
+        engine._state_entered_at = time.time() - 10
+
+        eye = _make_eye(
+            looking_at_screen=False,
+            attention_h=0.95,
+            attention_v=0.20,
+            head_pitch=0.05,
+            head_frontal_confidence=0.8,
+            eyes_closed_duration=4.0,
+            blinks_per_minute=55,
+        )
+        act = _make_activity(
+            app_classification="distracting",
+            in_productive_app=False,
+            keys_per_minute=0,
+            mouse_moves_per_minute=0,
+            total_idle_seconds=120,
+        )
+
+        early = engine.calculate(eye, act)
+        assert early.state == "Neutral"
+
+        engine._distracted_evidence_since = time.time() - 10
+        engine._state_entered_at = time.time() - 10
+        confirmed = engine.calculate(eye, act)
+        assert confirmed.state == "Distracted"
+
     def test_reading_boosts_activity_when_idle(self):
         """Reading with low mouse/keyboard should NOT be penalized."""
         engine = FocusEngine()
@@ -296,6 +349,12 @@ class TestFocusEngine:
         for _ in range(10):
             snap = engine.calculate(reading_eye, act)
         assert snap.gaze_stability_score >= 50
+
+    def test_state_timing_is_configurable(self):
+        engine = FocusEngine()
+        engine.set_state_timing(posture_grace_seconds=15, distracted_confirm_seconds=5)
+        assert engine._POSTURE_GRACE_SECONDS == 15
+        assert engine._DISTRACTED_CONFIRM_SECONDS == 5
 
     def test_weights_sum_to_one(self):
         """Score weights must sum to 1.0."""
@@ -555,6 +614,8 @@ class TestConfig:
         cfg = load_config()
         assert cfg["sound_enabled"] == DEFAULTS["sound_enabled"]
         assert cfg["distraction_threshold_seconds"] == 30
+        assert cfg["posture_grace_seconds"] == 12
+        assert cfg["distracted_confirm_seconds"] == 8
 
     def test_save_and_load(self, tmp_path, monkeypatch):
         config_file = tmp_path / "settings.json"

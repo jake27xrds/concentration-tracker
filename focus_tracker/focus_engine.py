@@ -112,6 +112,8 @@ class FocusEngine:
         baseline_enabled: bool = True,
         weekly_sessions_target: int = 5,
         auto_intent_enabled: bool = True,
+        posture_grace_seconds: float = 12.0,
+        distracted_confirm_seconds: float = 8.0,
     ):
         max_entries = history_minutes * 60  # ~1 per second
         self.history: deque[FocusSnapshot] = deque(maxlen=max_entries)
@@ -137,6 +139,13 @@ class FocusEngine:
         self._state_entered_at = time.time()
         self._HYSTERESIS_MARGIN = 3.0
         self._MIN_STATE_HOLD = 2.0
+
+        # Extra guards against false "Distracted" classifications.
+        self._POSTURE_GRACE_SECONDS = 12.0
+        self._DISTRACTED_CONFIRM_SECONDS = 8.0
+        self._posture_only_since: float | None = None
+        self._distracted_evidence_since: float | None = None
+        self.set_state_timing(posture_grace_seconds, distracted_confirm_seconds)
 
         # Auto-intent detection: rolling evidence buffers
         self._auto_intent_reading_conf: deque = deque(maxlen=60)   # ~60s
@@ -268,17 +277,7 @@ class FocusEngine:
         snap.focus_score = max(0, min(100, adjusted_score))
 
         # --- Determine State ---
-        if not eye.face_detected and activity.total_idle_seconds > 60:
-            raw_state = "Away"
-        elif snap.focus_score >= 80:
-            raw_state = "Deep Focus"
-        elif snap.focus_score >= 60:
-            raw_state = "Focused"
-        elif snap.focus_score >= 40:
-            raw_state = "Neutral"
-        else:
-            raw_state = "Distracted"
-
+        raw_state = self._resolve_state(eye, activity, snap.focus_score, classification, snap.activity_score)
         snap.state = self._apply_hysteresis(raw_state, snap.focus_score)
         self._update_goal_progress(snap)
 
@@ -316,6 +315,88 @@ class FocusEngine:
                 self._state_entered_at = now
 
         return self._current_state
+
+    def _resolve_state(
+        self,
+        eye: "EyeMetrics",
+        activity: "ActivityMetrics",
+        score: float,
+        app_classification: str,
+        activity_score: float,
+    ) -> str:
+        now = time.time()
+        if not eye.face_detected and activity.total_idle_seconds > 60:
+            self._posture_only_since = None
+            self._distracted_evidence_since = None
+            return "Away"
+
+        if score >= 80:
+            self._posture_only_since = None
+            self._distracted_evidence_since = None
+            return "Deep Focus"
+        if score >= 60:
+            self._posture_only_since = None
+            self._distracted_evidence_since = None
+            return "Focused"
+
+        engaged = self._has_recent_engagement(activity, app_classification, activity_score)
+        posture_shift = self._is_posture_shift_without_disengagement(eye)
+
+        posture_grace_active = False
+        if posture_shift and engaged:
+            if self._posture_only_since is None:
+                self._posture_only_since = now
+            posture_grace_active = (now - self._posture_only_since) < self._POSTURE_GRACE_SECONDS
+        else:
+            self._posture_only_since = None
+
+        strong_away_signal = (
+            (not eye.looking_at_screen)
+            and math.hypot(eye.attention_h, eye.attention_v) >= 0.9
+        )
+        low_engagement_signal = (not engaged) and activity.total_idle_seconds >= 25
+        distracted_evidence = (score < 40) and (strong_away_signal or low_engagement_signal)
+
+        if distracted_evidence:
+            if self._distracted_evidence_since is None:
+                self._distracted_evidence_since = now
+            evidence_age = now - self._distracted_evidence_since
+            if posture_grace_active and not low_engagement_signal:
+                return "Neutral"
+            if evidence_age < self._DISTRACTED_CONFIRM_SECONDS:
+                return "Neutral"
+            return "Distracted"
+
+        self._distracted_evidence_since = None
+        if score >= 40:
+            return "Neutral"
+        if posture_grace_active:
+            return "Neutral"
+        return "Distracted"
+
+    @staticmethod
+    def _has_recent_engagement(
+        activity: "ActivityMetrics",
+        app_classification: str,
+        activity_score: float,
+    ) -> bool:
+        return (
+            activity.total_idle_seconds < 20
+            or activity.keys_per_minute >= 4
+            or activity.mouse_moves_per_minute >= 10
+            or (app_classification in ("productive", "neutral") and activity_score >= 45)
+        )
+
+    @staticmethod
+    def _is_posture_shift_without_disengagement(eye: "EyeMetrics") -> bool:
+        if not eye.face_detected or eye.looking_at_screen:
+            return False
+
+        attention_mag = math.hypot(eye.attention_h, eye.attention_v)
+        vertical_bias = abs(eye.attention_v) > (abs(eye.attention_h) + 0.08)
+        head_pose_shift = abs(eye.head_pitch) > 0.22 or eye.head_frontal_confidence < 0.55
+        not_far_away = attention_mag < 0.85
+        return vertical_bias and head_pose_shift and not_far_away
 
     def get_average_score(self, last_n_seconds: int = 300) -> float:
         if not self.history:
@@ -388,6 +469,16 @@ class FocusEngine:
 
     def set_baseline_enabled(self, enabled: bool) -> None:
         self.baseline_enabled = bool(enabled)
+
+    def set_state_timing(
+        self,
+        posture_grace_seconds: float | None = None,
+        distracted_confirm_seconds: float | None = None,
+    ) -> None:
+        if posture_grace_seconds is not None:
+            self._POSTURE_GRACE_SECONDS = max(0.0, float(posture_grace_seconds))
+        if distracted_confirm_seconds is not None:
+            self._DISTRACTED_CONFIRM_SECONDS = max(0.0, float(distracted_confirm_seconds))
 
     def get_baseline_stats(self) -> dict:
         buf = self._baseline_buffers.get(self.current_intent)
